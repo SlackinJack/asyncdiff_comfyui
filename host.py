@@ -17,8 +17,6 @@ import torch.nn.functional as F
 from torchvision.io import decode_image
 
 from compel import Compel, ReturnedEmbeddingsType
-from distrifuser.pipelines import DistriSDPipeline, DistriSDXLPipeline
-from distrifuser.utils import DistriConfig
 from flask import Flask, request, jsonify
 from PIL import Image
 
