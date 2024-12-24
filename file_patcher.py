@@ -37,7 +37,7 @@ files_to_patch = [
             },
             {
                 "from": "emilianJR/epiCRealism",
-                "to":   "epic",
+                "to":   "ad",
             },
             {
                 "from": "stabilityai/stable-diffusion-x4-upscaler",

@@ -17,25 +17,19 @@ from torchvision.transforms import ToPILImage, ToTensor
 
 cwd = os.path.dirname(__file__)
 comfy_root = os.path.dirname(os.path.dirname(cwd))
-checkpoints_dir = os.path.join(os.path.join(comfy_root, "models"), "checkpoints")
+models_dir = os.path.join(os.path.join(comfy_root, "models"))
+checkpoints_dir = os.path.join(models_dir, "checkpoints")
 outputs_dir = os.path.join(comfy_root, "output")
+
+models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
 
 
 class AsyncDiffSVDPipelineLoader:
     @classmethod
     def INPUT_TYPES(s):
-        models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
         return {
             "required": {
-                "model": (models,), 
-                "pipeline_type": (
-                    list([
-                        "svd",
-                    ]),
-                    {
-                        "default": "svd",
-                    }
-                ),
+                "model": (models,),
                 "nproc_per_node": (
                     "INT",
                     {
@@ -45,6 +39,40 @@ class AsyncDiffSVDPipelineLoader:
                         "step": 1
                     }
                 ),
+                "model_n": (
+                    list([
+                        2,
+                        3,
+                        4
+                    ]),
+                    {
+                        "default": 2,
+                    }
+                ),
+                "stride": (
+                    list([
+                        1,
+                        2
+                    ]),
+                    {
+                        "default": 1,
+                    }
+                ),
+                "time_shift": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                    }
+                ),
+                "variant": (
+                    list([
+                        "fp16",
+                        "fp32"
+                    ]),
+                    {
+                        "default": "fp16",
+                    }
+                ),
             }
         }
 
@@ -52,14 +80,18 @@ class AsyncDiffSVDPipelineLoader:
     FUNCTION = "launch_host"
     CATEGORY = "AsyncDiff"        
 
-    def launch_host(self, model, pipeline_type, nproc_per_node):
+    def launch_host(self, model, nproc_per_node, model_n, stride, time_shift, variant):
         cmd = [
             'torchrun',
             f'--nproc_per_node={nproc_per_node}',
             f'{cwd}/host.py',
 
             f'--model={checkpoints_dir}/{model}',
-            f'--pipeline_type={pipeline_type}',
+            f'--pipeline_type=svd',
+            f'--model_n={model_n}',
+            f'--stride={stride}',
+            f'--time_shift={time_shift}',
+            f'--variant={variant}',
             # f'--scheduler={scheduler}',
         ]
 
@@ -77,7 +109,7 @@ class AsyncDiffSVDPipelineLoader:
         return (f"{host}/generate", )
 
 
-class AsyncDiffSVDSampler:
+class AsyncDiffImg2VidSampler:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -134,6 +166,23 @@ class AsyncDiffSVDSampler:
                         "max": 1024
                     }
                 ),
+                "motion_bucket_id": (
+                    "INT",
+                    {
+                        "default": 180,
+                        "min": 1,
+                        "max": 1024
+                    }
+                ),
+                "noise_aug_strength": (
+                    "FLOAT",
+                    {
+                        "default": 0.1,
+                        "min": 0,
+                        "max": 1024,
+                        "step": 0.01
+                    }
+                ),
             }
         }
 
@@ -142,7 +191,11 @@ class AsyncDiffSVDSampler:
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, pipeline, image, width, height, steps, seed, decode_chunk_size, num_frames):
+    def generate(
+        self,
+        pipeline, image, width, height, steps, seed, decode_chunk_size,
+        num_frames, motion_bucket_id, noise_aug_strength
+    ):
         url = pipeline
         image = image.squeeze(0)        # NHWC -> HWC
         image = image.permute(2, 0, 1)  # HWC -> CHW
@@ -157,6 +210,8 @@ class AsyncDiffSVDSampler:
             "seed": seed,
             "decode_chunk_size": decode_chunk_size,
             "num_frames": num_frames,
+            "motion_bucket_id": motion_bucket_id,
+            "noise_aug_strength": noise_aug_strength,
             "output_path": outputs_dir,
         }
         response = requests.post(url, json=data)
@@ -179,12 +234,12 @@ class AsyncDiffSVDSampler:
 
 
 NODE_CLASS_MAPPINGS = {
+    "AsyncDiffImg2VidSampler": AsyncDiffImg2VidSampler,
     "AsyncDiffSVDPipelineLoader": AsyncDiffSVDPipelineLoader,
-    "AsyncDiffSVDSampler": AsyncDiffSVDSampler,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "AsyncDiffImg2VidSampler": "AsyncDiffImg2VidSampler",
     "AsyncDiffSVDPipelineLoader": "AsyncDiffSVDPipelineLoader",
-    "AsyncDiffSVDSampler": "AsyncDiffSVDSampler",
 }
