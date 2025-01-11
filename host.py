@@ -218,11 +218,15 @@ def generate_image_parallel(
                 motion_bucket_id=motion_bucket_id,
                 noise_aug_strength=noise_aug_strength,
                 output_type="pil",
-            )
+            )  # .frames[0]
     end_time = time.time()
     elapsed_time = end_time - start_time
 
     torch.cuda.empty_cache()
+
+    # if dist.get_rank() == 0:
+        # export_to_video(output, f"{output_path}.mp4", fps=7)
+        # export_to_gif(output, f"{output_path}.gif")
 
     return output, elapsed_time
 
@@ -243,6 +247,8 @@ def generate_image():
 
     assert image is not None, "No image provided"
     assert output_path is not None, "No output path provided"
+
+    # image = Image.open(image)
 
     logger.info(
         "Request parameters:\n"
