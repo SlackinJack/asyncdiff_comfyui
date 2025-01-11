@@ -21,19 +21,19 @@ from AsyncDiff.asyncdiff.async_sd import AsyncDiff
 from diffusers import StableVideoDiffusionPipeline
 from diffusers.utils import load_image, export_to_video, export_to_gif
 
-# from diffusers.schedulers import (
-#     DDIMScheduler,
-#     DPMSolverMultistepScheduler,
-#     DPMSolverSinglestepScheduler,
-#     EulerAncestralDiscreteScheduler,
-#     EulerDiscreteScheduler,
-#     HeunDiscreteScheduler,
-#     LMSDiscreteScheduler,
-#     KDPM2AncestralDiscreteScheduler,
-#     KDPM2DiscreteScheduler,
-#     PNDMScheduler,
-#     UniPCMultistepScheduler,
-# )
+from diffusers.schedulers import (
+    DDIMScheduler,
+    DPMSolverMultistepScheduler,
+    DPMSolverSinglestepScheduler,
+    EulerAncestralDiscreteScheduler,
+    EulerDiscreteScheduler,
+    HeunDiscreteScheduler,
+    LMSDiscreteScheduler,
+    KDPM2AncestralDiscreteScheduler,
+    KDPM2DiscreteScheduler,
+    PNDMScheduler,
+    UniPCMultistepScheduler,
+)
 
 app = Flask(__name__)
 
@@ -47,42 +47,42 @@ initialized = False
 async_diff = None
 
 
-# def get_scheduler(scheduler_name, current_scheduler_config):
-#     scheduler_class = get_scheduler_class(scheduler_name)
-#     scheduler_config = get_scheduler_config(scheduler_name, current_scheduler_config)
-#     return scheduler_class.from_config(scheduler_config)
+def get_scheduler(scheduler_name, current_scheduler_config):
+    scheduler_class = get_scheduler_class(scheduler_name)
+    scheduler_config = get_scheduler_config(scheduler_name, current_scheduler_config)
+    return scheduler_class.from_config(scheduler_config)
 
 
-# def get_scheduler_class(scheduler_name):
-#     if scheduler_name.startswith("k_"):
-#         scheduler_name.replace("k_", "", 1)
+def get_scheduler_class(scheduler_name):
+    if scheduler_name.startswith("k_"):
+        scheduler_name.replace("k_", "", 1)
 
-#     match scheduler_name:
-#         case "ddim":            return DDIMScheduler
-#         case "euler":           return EulerDiscreteScheduler
-#         case "euler_a":         return EulerAncestralDiscreteScheduler
-#         case "dpm_2":           return KDPM2DiscreteScheduler
-#         case "dpm_2_a":         return KDPM2AncestralDiscreteScheduler
-#         case "dpmpp_2m":        return DPMSolverMultistepScheduler
-#         case "dpmpp_2m_sde":    return DPMSolverMultistepScheduler
-#         case "dpmpp_sde":       return DPMSolverSinglestepScheduler
-#         case "heun":            return HeunDiscreteScheduler
-#         case "lms":             return LMSDiscreteScheduler
-#         case "pndm":            return PNDMScheduler
-#         case "unipc":           return UniPCMultistepScheduler
-#         case _:                 raise NotImplementedError
+    match scheduler_name:
+        case "ddim":            return DDIMScheduler
+        case "euler":           return EulerDiscreteScheduler
+        case "euler_a":         return EulerAncestralDiscreteScheduler
+        case "dpm_2":           return KDPM2DiscreteScheduler
+        case "dpm_2_a":         return KDPM2AncestralDiscreteScheduler
+        case "dpmpp_2m":        return DPMSolverMultistepScheduler
+        case "dpmpp_2m_sde":    return DPMSolverMultistepScheduler
+        case "dpmpp_sde":       return DPMSolverSinglestepScheduler
+        case "heun":            return HeunDiscreteScheduler
+        case "lms":             return LMSDiscreteScheduler
+        case "pndm":            return PNDMScheduler
+        case "unipc":           return UniPCMultistepScheduler
+        case _:                 raise NotImplementedError
 
 
-# def get_scheduler_config(scheduler_name, current_scheduler_config):
-#     if scheduler_name.startswith("k_"):
-#         current_scheduler_config["use_karras_sigmas"] = True
-#     match scheduler_name:
-#         case "dpmpp_2m":
-#             current_scheduler_config["algorithm_type"] = "dpmsolver++"
-#             current_scheduler_config["solver_order"] = 2
-#         case "dpmpp_2m_sde":
-#             current_scheduler_config["algorithm_type"] = "sde-dpmsolver++"
-#     return current_scheduler_config
+def get_scheduler_config(scheduler_name, current_scheduler_config):
+    if scheduler_name.startswith("k_"):
+        current_scheduler_config["use_karras_sigmas"] = True
+    match scheduler_name:
+        case "dpmpp_2m":
+            current_scheduler_config["algorithm_type"] = "dpmsolver++"
+            current_scheduler_config["solver_order"] = 2
+        case "dpmpp_2m_sde":
+            current_scheduler_config["algorithm_type"] = "sde-dpmsolver++"
+    return current_scheduler_config
 
 
 def get_args() -> argparse.Namespace:
@@ -95,8 +95,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--time_shift", type=bool, default=False)
     # added args
     parser.add_argument("--pipeline_type", type=str, default=None, choices=["ad", "sd1", "sd2", "sd3", "sdup", "sdxl", "svd"])
-    parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [fp16/fp32]")
-    # parser.add_argument("--scheduler", type=str, default="ddim")
+    parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [bf16/fp16/fp32]")
+    parser.add_argument("--scheduler", type=str, default="ddim")
     args = parser.parse_args()
     return args
 
@@ -133,7 +133,14 @@ def initialize():
     args = get_args()
     assert args.model is not None, "No model provided"
     assert args.pipeline_type is not None, "No pipeline type provided"
-    assert args.variant in ["fp16", "fp32"], "Unsupported variant"
+    assert args.variant in ["bf16", "fp16", "fp32"], "Unsupported variant"
+    match args.variant:
+        case "bf16":
+            torch_dtype = torch.bfloat16
+        case "fp16":
+            torch_dtype = torch.float16
+        case _:
+            torch_dtype = torch.float32
 
     # Load the conditioning image
     image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/svd/rocket.png?download=true")
@@ -144,7 +151,7 @@ def initialize():
         case "svd":
             pipe = StableVideoDiffusionPipeline.from_pretrained(
                 args.model,
-                torch_dtype=torch.float16 if args.variant == "fp16" else torch.float32,
+                torch_dtype=torch_dtype,
             )
         case _: raise NotImplementedError
 

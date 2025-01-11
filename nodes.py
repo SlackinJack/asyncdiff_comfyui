@@ -24,12 +24,34 @@ outputs_dir = os.path.join(comfy_root, "output")
 models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
 
 
+pipeline_process = None
+
+
 class AsyncDiffSVDPipelineLoader:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "model": (models,),
+                # "scheduler": (
+                #     list([
+                #         "ddim",
+                #         "euler",
+                #         "euler_a",
+                #         "dpm_2",
+                #         "dpm_2_a",
+                #         "dpmpp_2m",
+                #         "dpmpp_2m_sde",
+                #         "dpmpp_sde",
+                #         "heun",
+                #         "lms",
+                #         "pndm",
+                #         "unipc",
+                #     ]),
+                #     {
+                #         "default": "dpmpp_2m",
+                #     }
+                # ),
                 "nproc_per_node": (
                     "INT",
                     {
@@ -66,6 +88,7 @@ class AsyncDiffSVDPipelineLoader:
                 ),
                 "variant": (
                     list([
+                        "bf16",
                         "fp16",
                         "fp32"
                     ]),
@@ -80,7 +103,7 @@ class AsyncDiffSVDPipelineLoader:
     FUNCTION = "launch_host"
     CATEGORY = "AsyncDiff"        
 
-    def launch_host(self, model, nproc_per_node, model_n, stride, time_shift, variant):
+    def launch_host(self, model, nproc_per_node, model_n, stride, time_shift, variant, scheduler=None):
         cmd = [
             'torchrun',
             f'--nproc_per_node={nproc_per_node}',
@@ -95,12 +118,14 @@ class AsyncDiffSVDPipelineLoader:
             # f'--scheduler={scheduler}',
         ]
 
-        process = subprocess.Popen(cmd)
+        global pipeline_process
+        pipeline_process = subprocess.Popen(cmd)
         host = 'http://localhost:6000'
         while True:
             try:
                 response = requests.get(f'{host}/initialize')
                 if response.status_code == 200 and response.json().get("status") == "initialized":
+                    print("\n###### Pipeline is ready ######\n")
                     break
             except requests.exceptions.RequestException:
                 pass
@@ -183,6 +208,12 @@ class AsyncDiffImg2VidSampler:
                         "step": 0.01
                     }
                 ),
+                "shutdown_pipeline": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                    }
+                ),
             }
         }
 
@@ -194,8 +225,11 @@ class AsyncDiffImg2VidSampler:
     def generate(
         self,
         pipeline, image, width, height, steps, seed, decode_chunk_size,
-        num_frames, motion_bucket_id, noise_aug_strength
+        num_frames, motion_bucket_id, noise_aug_strength, shutdown_pipeline
     ):
+        global pipeline_process
+        if pipeline_process is None:
+            return (None,)
         url = pipeline
         image = image.squeeze(0)        # NHWC -> HWC
         image = image.permute(2, 0, 1)  # HWC -> CHW
@@ -217,6 +251,9 @@ class AsyncDiffImg2VidSampler:
         response = requests.post(url, json=data)
         response_data = response.json()
         output_base64 = response_data.get("output")
+        if shutdown_pipeline:
+            pipeline_process.terminate()
+            pipeline_process = None
         if output_base64:
             print("Media generated")
             output_bytes = base64.b64decode(output_base64)
