@@ -1,5 +1,3 @@
-# https://github.com/xdit-project/xDiT/blob/1c31746e2f903e791bc2a41a0bc23614958e46cd/comfyui-xdit/host.py
-
 import argparse
 import base64
 import json
@@ -11,14 +9,13 @@ import time
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.nn.functional as F
 
 from compel import Compel, ReturnedEmbeddingsType
 from flask import Flask, request, jsonify
 from PIL import Image
 
 from AsyncDiff.asyncdiff.async_sd import AsyncDiff
-from diffusers import StableVideoDiffusionPipeline
+from diffusers import StableDiffusionUpscalePipeline, StableVideoDiffusionPipeline
 from diffusers.utils import load_image, export_to_video, export_to_gif
 
 from diffusers.schedulers import (
@@ -87,16 +84,24 @@ def get_scheduler_config(scheduler_name, current_scheduler_config):
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default=None)   
+    parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--seed", type=int, default=20)
     parser.add_argument("--model_n", type=int, default=2, choices=[2, 3, 4])
     parser.add_argument("--stride", type=int, default=1, choices=[1, 2])
     parser.add_argument("--warm_up", type=int, default=1)
     parser.add_argument("--time_shift", type=bool, default=False)
     # added args
+    parser.add_argument("--host_mode", type=str, default=None, choices=["comfyui", "localai"], help="Host operation mode")
     parser.add_argument("--pipeline_type", type=str, default=None, choices=["ad", "sd1", "sd2", "sd3", "sdup", "sdxl", "svd"])
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [bf16/fp16/fp32]")
     parser.add_argument("--scheduler", type=str, default="ddim")
+    parser.add_argument("--enable_model_cpu_offload", action="store_true")
+    parser.add_argument("--enable_sequential_cpu_offload", action="store_true")
+    parser.add_argument("--enable_tiling", action="store_true")
+    parser.add_argument("--enable_slicing", action="store_true")
+    parser.add_argument("--xformers_efficient", action="store_true")
+    parser.add_argument("--scale_input", action="store_true")
+    parser.add_argument("--scale_percentage", type=float, default=75.0)
     args = parser.parse_args()
     return args
 
@@ -131,6 +136,7 @@ def initialize():
     logger.info(f"Initializing model on GPU: {torch.cuda.current_device()}")
 
     args = get_args()
+    assert args.host_mode is not None, "Please specify a host operation mode."
     assert args.model is not None, "No model provided"
     assert args.pipeline_type is not None, "No pipeline type provided"
     assert args.variant in ["bf16", "fp16", "fp32"], "Unsupported variant"
@@ -142,16 +148,18 @@ def initialize():
         case _:
             torch_dtype = torch.float32
 
-    # Load the conditioning image
-    image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/svd/rocket.png?download=true")
-    file_name = "rocket"
-    image = image.resize((512, 288))
-
     match args.pipeline_type:
+        case "sdup":
+            pipe = StableDiffusionUpscalePipeline.from_pretrained(
+                args.model,
+                torch_dtype=torch_dtype,
+                use_safetensors=True,
+            )
         case "svd":
             pipe = StableVideoDiffusionPipeline.from_pretrained(
                 args.model,
                 torch_dtype=torch_dtype,
+                use_safetensors=True,
             )
         case _: raise NotImplementedError
 
@@ -166,24 +174,44 @@ def initialize():
     )
 
     pipe.set_progress_bar_config(disable=dist.get_rank() != 0)
-    # low vram test
-    # pipe.enable_xformers_memory_efficient_attention()
-    # pipe.unet.enable_forward_chunking()
+
+    if args.pipeline_type != "svd":
+        if args.enable_slicing:
+            pipe.enable_vae_slicing()
+        if args.enable_tiling:
+            pipe.enable_vae_tiling()
+        if args.xformers_efficient:
+            pipe.enable_xformers_memory_efficient_attention()
+    if args.enable_model_cpu_offload:
+        pipe.enable_model_cpu_offload()
+    if args.enable_sequential_cpu_offload:
+        pipe.enable_sequential_cpu_offload()
 
     # warm up
     logger.info("Starting warmup run")
+    image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/svd/rocket.png?download=true")
+    image = image.resize((512, 288))
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     async_diff.reset_state(warm_up=args.warm_up)
     match args.pipeline_type:
-        case _:
+        case "sdup":
+            pipe(
+                prompt="detailed",
+                negative_prompt="blurry",
+                image=image,
+                num_inference_steps=10,
+            )
+        case "svd":
             pipe(
                 image,
                 decode_chunk_size=1,
-                num_inference_steps=2,
+                num_inference_steps=10,
                 width=320,
                 height=320,
             )
+        case _:
+            return
 
     torch.cuda.empty_cache()
 
@@ -193,7 +221,9 @@ def initialize():
 
 
 def generate_image_parallel(
-    image, width, height, num_inference_steps, seed, num_frames, decode_chunk_size, motion_bucket_id, noise_aug_strength, output_path
+    image, positive_prompt, negative_prompt, width, height,
+    num_inference_steps, seed, num_frames, decode_chunk_size,
+    motion_bucket_id, noise_aug_strength, output_path,
 ):
     global pipe, async_diff
     torch.cuda.reset_peak_memory_stats()
@@ -206,8 +236,21 @@ def generate_image_parallel(
     async_diff.reset_state(warm_up=args.warm_up)
 
     image = load_image(image)
+    if args.scale_input:
+        image = image.resize(
+            (int(image.size[0] * args.scale_percentage / 100), int(image.size[1] * args.scale_percentage / 100)),
+            Image.Resampling.LANCZOS
+        )
     match args.pipeline_type:
-        case _:
+        case "sdup":
+            output = pipe(
+                prompt=positive_prompt,
+                negative_prompt=negative_prompt,
+                image=image,
+                num_inference_steps=num_inference_steps,
+                output_type="pil",
+            ).images[0]
+        case "svd":
             output = pipe(
                 image,
                 width=width,
@@ -218,23 +261,39 @@ def generate_image_parallel(
                 motion_bucket_id=motion_bucket_id,
                 noise_aug_strength=noise_aug_strength,
                 output_type="pil",
-            )  # .frames[0]
+            ).frames[0]
+        case _:
+            return
     end_time = time.time()
     elapsed_time = end_time - start_time
 
     torch.cuda.empty_cache()
 
-    # if dist.get_rank() == 0:
-        # export_to_video(output, f"{output_path}.mp4", fps=7)
-        # export_to_gif(output, f"{output_path}.gif")
+    if dist.get_rank() == 0:
+        if args.host_mode == "comfyui":
+            return output, elapsed_time
+        elif args.host_mode == "localai":
+            match args.pipeline_type:
+                case "sdup":
+                    output.save(output_path)
+                case "svd":
+                    output_path = output_path.replace(".png", "")
+                    # export_to_video(output, f"{output_path}.mp4", fps=7)
+                    export_to_gif(output, f"{output_path}.gif")
+                case _:
+                    return
+            return output_path, elapsed_time
 
-    return output, elapsed_time
 
 @app.route("/generate", methods=["POST"])
 def generate_image():
+    args = get_args()
+
     logger.info("Received POST request for image generation")
     data = request.json
     image               = data.get("image", None)
+    positive_prompt     = data.get("positive_prompt", None)
+    negative_prompt     = data.get("negative_prompt", None)
     width               = data.get("width", 512)
     height              = data.get("height", 512)
     num_inference_steps = data.get("num_inference_steps", 30)
@@ -248,10 +307,13 @@ def generate_image():
     assert image is not None, "No image provided"
     assert output_path is not None, "No output path provided"
 
-    # image = Image.open(image)
+    if args.host_mode == "localai":
+        image = Image.open(image)
 
     logger.info(
         "Request parameters:\n"
+        f"positive_prompt={positive_prompt}\n"
+        f"negative_prompt={negative_prompt}\n"
         f"width={width}\n"
         f"height={height}\n"
         f"steps={num_inference_steps}\n"
@@ -262,23 +324,41 @@ def generate_image():
         f"noise_aug_strength={noise_aug_strength}\n"
         f"output_path={output_path}"
     )
+
     # Broadcast request parameters to all processes
-    image = base64.b64decode(image)
-    image = pickle.loads(image)
-    params = [image, width, height, num_inference_steps, seed, num_frames, decode_chunk_size, motion_bucket_id, noise_aug_strength, output_path]
+    if args.host_mode == "comfyui":
+        image = base64.b64decode(image)
+        image = pickle.loads(image)
+
+    params = [
+        image,
+        positive_prompt,
+        negative_prompt,
+        width,
+        height,
+        num_inference_steps,
+        seed,
+        num_frames,
+        decode_chunk_size,
+        motion_bucket_id,
+        noise_aug_strength,
+        output_path
+    ]
     dist.broadcast_object_list(params, src=0)
     logger.info("Parameters broadcasted to all processes")
 
     output, elapsed_time = generate_image_parallel(*params)
 
-    output = pickle.dumps(output)
-    output_b64 = base64.b64encode(output).decode("utf-8")
     response = {
         "message": "Image generated successfully",
         "elapsed_time": f"{elapsed_time:.2f} sec",
-        "output": output_b64,
     }
-
+    if args.host_mode == "comfyui":
+        output = pickle.dumps(output)
+        output_b64 = base64.b64encode(output).decode("utf-8")
+        response["output"] = output_b64
+    elif args.host_mode == "localai":
+        response["output_path"] = output
     logger.info("Sending response")
     return jsonify(response)
 
@@ -289,7 +369,7 @@ def run_host():
         app.run(host="0.0.0.0", port=6000)
     else:
         while True:
-            params = [None] * 10 # len(params) of generate_image_parallel()
+            params = [None] * 12 # len(params) of generate_image_parallel()
             logger.info(f"Rank {dist.get_rank()} waiting for tasks")
             dist.broadcast_object_list(params, src=0)
             if params[0] is None:
