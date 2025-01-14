@@ -14,8 +14,11 @@ from compel import Compel, ReturnedEmbeddingsType
 from flask import Flask, request, jsonify
 from PIL import Image
 
-from AsyncDiff.asyncdiff.async_sd import AsyncDiff
+from AsyncDiff.asyncdiff.async_animate import AsyncDiff as AsyncDiffAD
+from AsyncDiff.asyncdiff.async_sd import AsyncDiff as AsyncDiffSD
 from diffusers import (
+    AnimateDiffPipeline,
+    MotionAdapter,
     StableDiffusion3Pipeline,
     StableDiffusionPipeline,
     StableDiffusionUpscalePipeline,
@@ -100,6 +103,7 @@ def get_args() -> argparse.Namespace:
     # added args
     parser.add_argument("--host_mode", type=str, default=None, choices=["comfyui", "localai"], help="Host operation mode")
     parser.add_argument("--pipeline_type", type=str, default=None, choices=["ad", "sd1", "sd2", "sd3", "sdup", "sdxl", "svd"])
+    parser.add_argument("--motion_adapter", type=str, default=None)
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [bf16/fp16/fp32]")
     parser.add_argument("--scheduler", type=str, default="ddim")
     parser.add_argument("--enable_model_cpu_offload", action="store_true")
@@ -156,6 +160,28 @@ def initialize():
 
     assert args.pipeline_type is not None, "No pipeline type provided"
     match args.pipeline_type:
+        case "ad":
+            assert args.motion_adapter is not None, "No motion adapter provided"
+            adapter = MotionAdapter.from_pretrained(
+                args.motion_adapter,
+                torch_dtype=torch_dtype,
+                use_safetensors=True,
+            )
+            pipe = AnimateDiffPipeline.from_pretrained(
+                args.model,
+                motion_adapter=adapter,
+                torch_dtype=torch_dtype,
+                use_safetensors=True,
+            )
+            scheduler = DDIMScheduler.from_pretrained(
+                args.model,
+                subfolder="scheduler",
+                clip_sample=False,
+                timestep_spacing="linspace",
+                beta_schedule="linear",
+                steps_offset=1,
+            )
+            pipe.scheduler = scheduler
         case "sd1":
             pipe = StableDiffusionPipeline.from_pretrained(
                 args.model,
@@ -197,13 +223,22 @@ def initialize():
     if args.pipeline_type in ["sd1", "sd2", "sd3", "sdup", "sdxl"]:
         pipe.scheduler = get_scheduler(args.scheduler, pipe.scheduler.config)
 
-    async_diff = AsyncDiff(
-        pipe,
-        args.pipeline_type,
-        model_n=args.model_n,
-        stride=args.stride,
-        time_shift=args.time_shift,
-    )
+    if args.pipeline_type in ["ad"]:
+        async_diff = AsyncDiffAD(
+            pipe,
+            args.pipeline_type,
+            model_n=args.model_n,
+            stride=args.stride,
+            time_shift=args.time_shift,
+        )
+    else:
+        async_diff = AsyncDiffSD(
+            pipe,
+            args.pipeline_type,
+            model_n=args.model_n,
+            stride=args.stride,
+            time_shift=args.time_shift,
+        )
 
     pipe.set_progress_bar_config(disable=dist.get_rank() != 0)
 
@@ -229,6 +264,14 @@ def initialize():
     torch.cuda.manual_seed_all(args.seed)
     async_diff.reset_state(warm_up=args.warm_up)
     match args.pipeline_type:
+        case "ad":
+            pipe(
+                prompt="test",
+                negative_prompt="blurry",
+                num_frames=15,
+                guidance_scale=3.5,
+                num_inference_steps=10,
+            )
         case "sdup":
             pipe(
                 prompt="detailed",
@@ -286,6 +329,17 @@ def generate_image_parallel(
             )
 
     match args.pipeline_type:
+        case "ad":
+            output = pipe(
+                prompt=positive_prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=cfg,
+                num_frames=num_frames,
+                output_type="pil",
+            ).frames[0]
         case "sdup":
             output = pipe(
                 prompt=positive_prompt,

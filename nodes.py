@@ -18,8 +18,20 @@ host_address_generate = f'{host_address}/generate'
 host_address_initialize = f'{host_address}/initialize'
 
 
+cwd = os.path.dirname(__file__)
+comfy_root = os.path.dirname(os.path.dirname(cwd))
+models_dir = os.path.join(os.path.join(comfy_root, "models"))
+checkpoints_dir = os.path.join(models_dir, "checkpoints")
+outputs_dir = os.path.join(comfy_root, "output")
+models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
+
+
 INT_MAX = 2 ** 32 - 1
 BOOLEAN_DEFAULT_FALSE = ("BOOLEAN", { "default": False })
+CONFIG =                ("AD_CONFIG",)
+IMAGE =                 ("IMAGE",)
+MODEL =                 ("AD_MODEL",)
+MODEL_LIST =            (models,)
 
 
 SCHEDULERS = (
@@ -27,9 +39,9 @@ SCHEDULERS = (
     { "default": "dpmpp_2m" }
 )
 VARIANT =           (["bf16", "fp16", "fp32"],  { "default": "fp16" })
-MODEL_N =           ([2, 3, 4],                 { "default": 2 })
-STRIDE =            ([1, 2],                    { "default": 1 })
-NPROC_PER_NODE =    ("INT",                     { "default": 2,     "min": 1,       "max": INT_MAX, "step": 1 })
+MODEL_N =           ("INT",                     { "default": 2,     "min": 2,       "max": 4,       "step": 1 })
+STRIDE =            ("INT",                     { "default": 1,     "min": 1,       "max": 2,       "step": 1 })
+NPROC_PER_NODE =    ("INT",                     { "default": 2,     "min": 1,       "max": 4,       "step": 1 })
 SCALE_PERCENTAGE =  ("FLOAT",                   { "default": 75.0,  "min": 0.01,    "max": INT_MAX, "step": 0.01 })
 
 
@@ -44,12 +56,17 @@ CFG =                   ("FLOAT",   { "default": 3.5,   "min": 0,   "max": INT_M
 NOISE_AUG_STRENGTH =    ("FLOAT",   { "default": 0.01,  "min": 0,   "max": INT_MAX, "step": 0.01 })
 
 
-cwd = os.path.dirname(__file__)
-comfy_root = os.path.dirname(os.path.dirname(cwd))
-models_dir = os.path.join(os.path.join(comfy_root, "models"))
-checkpoints_dir = os.path.join(models_dir, "checkpoints")
-outputs_dir = os.path.join(comfy_root, "output")
-models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
+class ADModelSelector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "required": { "model": MODEL_LIST } }
+
+    RETURN_TYPES = MODEL
+    FUNCTION = "get_model"
+    CATEGORY = "AsyncDiff"        
+
+    def get_model(self, model):
+        return (model,)
 
 
 class ADPipelineConfig:
@@ -57,7 +74,6 @@ class ADPipelineConfig:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model":                            (models,),
                 "nproc_per_node":                   NPROC_PER_NODE,
                 "model_n":                          MODEL_N,
                 "stride":                           STRIDE,
@@ -73,16 +89,17 @@ class ADPipelineConfig:
             }
         }
 
-    RETURN_TYPES = ("AD_CONFIG",)
+    RETURN_TYPES = CONFIG
     FUNCTION = "get_config"
     CATEGORY = "AsyncDiff"        
 
-    def get_config(self, model, nproc_per_node, model_n, stride, time_shift, variant, scale_input, scale_percentage,
-        enable_tiling, enable_slicing, xformers_efficient, enable_model_cpu_offload=False, enable_sequential_cpu_offload=False
+    def get_config(
+        self, nproc_per_node, model_n, stride, time_shift, variant,
+        scale_input, scale_percentage, enable_tiling, enable_slicing, xformers_efficient,
+        enable_model_cpu_offload=False, enable_sequential_cpu_offload=False
     ):
         return (
             {
-                "model":                            model,
                 "nproc_per_node":                   nproc_per_node,
                 "model_n":                          model_n,
                 "stride":                           stride,
@@ -99,12 +116,73 @@ class ADPipelineConfig:
         )
 
 
+class ADADSampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model":            MODEL,
+                "motion_adapter":   MODEL,
+                "config":           CONFIG,
+                "positive_prompt":  PROMPT,
+                "negative_prompt":  PROMPT,
+                "width":            RESOLUTION,
+                "height":           RESOLUTION,
+                "seed":             SEED,
+                "steps":            STEPS,
+                "guidance_scale":   CFG,
+                "num_frames":       NUM_FRAMES,
+            }
+        }
+
+    RETURN_TYPES = IMAGE
+    FUNCTION = "generate"
+    CATEGORY = "AsyncDiff"
+
+    def generate(
+        self,
+        model, motion_adapter, config, positive_prompt, negative_prompt,
+        width, height, seed, steps, guidance_scale, num_frames
+    ):
+        config["pipeline_type"] =   "ad"
+        config["model"] =           model
+        config["motion_adapter"] =  motion_adapter
+        launch_host_process(config)
+
+        # TODO: IPAdapter, load image for input
+        # image = image.squeeze(0)        # NHWC -> HWC
+        # b64_image = convert_tensor_to_b64(image)
+        data = {
+            "positive_prompt":      positive_prompt,
+            "negative_prompt":      negative_prompt,
+            "width":                width,
+            "height":               height,
+            "seed":                 seed,
+            "num_inference_steps":  steps,
+            "guidance_scale":       guidance_scale,
+            "num_frames":           num_frames,
+        }
+        response = get_result(data)
+        close_host_process()
+        if response is not None:
+            print("Media generated")
+            output_bytes = base64.b64decode(response)
+            images = pickle.loads(output_bytes)
+            tensors = []
+            for i in images:
+                tensors.append(convert_image_to_hwc_tensor(i))
+            return (torch.stack(tuple(tensors)),)   # HWC -> NHWC
+        else:
+            assert False, "No media generated"
+
+
 class ADSD1Sampler:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "config":           ("AD_CONFIG",),
+                "model":            MODEL,
+                "config":           CONFIG,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
                 "width":            RESOLUTION,
@@ -116,35 +194,29 @@ class ADSD1Sampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = IMAGE
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, positive_prompt, negative_prompt, width, height, scheduler, steps, guidance_scale, seed, config):
-        config["pipeline_type"] = "sd1"
-        config["scheduler"] = scheduler
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+        config["pipeline_type"] =   "sd1"
+        config["model"] =           model
+        config["scheduler"] =       scheduler
         launch_host_process(config)
+
         data = {
             "positive_prompt":      positive_prompt,
             "negative_prompt":      negative_prompt,
             "width":                width,
             "height":               height,
+            "seed":                 seed,
             "num_inference_steps":  steps,
             "guidance_scale":       guidance_scale,
-            "seed":                 seed,
-            "output_path":          outputs_dir,
         }
-        response = requests.post(host_address_generate, json=data)
-        response_data = response.json()
-        output_base64 = response_data.get("output")
+        response = get_result(data)
         close_host_process()
-        if output_base64:
-            output_bytes = base64.b64decode(output_base64)
-            im2 = pickle.loads(output_bytes)
-            tensor_image = ToTensor()(im2)                      # CHW
-            tensor_image = tensor_image.unsqueeze(0)            # CHW -> NCHW
-            tensor_image = tensor_image.permute(0, 2, 3, 1)     # NCHW -> NHWC
-            return (tensor_image,)
+        if response is not None:
+            return (convert_b64_to_nhwc_tensor(response),)
         else:
             assert False, "No media generated"
 
@@ -154,7 +226,8 @@ class ADSD2Sampler:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "config":           ("AD_CONFIG",),
+                "model":            MODEL,
+                "config":           CONFIG,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
                 "width":            RESOLUTION,
@@ -166,35 +239,29 @@ class ADSD2Sampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = IMAGE
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, positive_prompt, negative_prompt, width, height, scheduler, steps, guidance_scale, seed, config):
-        config["pipeline_type"] = "sd2"
-        config["scheduler"] = scheduler
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+        config["pipeline_type"] =   "sd2"
+        config["model"] =           model
+        config["scheduler"] =       scheduler
         launch_host_process(config)
+
         data = {
             "positive_prompt":      positive_prompt,
             "negative_prompt":      negative_prompt,
             "width":                width,
             "height":               height,
+            "seed":                 seed,
             "num_inference_steps":  steps,
             "guidance_scale":       guidance_scale,
-            "seed":                 seed,
-            "output_path":          outputs_dir,
         }
-        response = requests.post(host_address_generate, json=data)
-        response_data = response.json()
-        output_base64 = response_data.get("output")
+        response = get_result(data)
         close_host_process()
-        if output_base64:
-            output_bytes = base64.b64decode(output_base64)
-            im2 = pickle.loads(output_bytes)
-            tensor_image = ToTensor()(im2)                      # CHW
-            tensor_image = tensor_image.unsqueeze(0)            # CHW -> NCHW
-            tensor_image = tensor_image.permute(0, 2, 3, 1)     # NCHW -> NHWC
-            return (tensor_image,)
+        if response is not None:
+            return (convert_b64_to_nhwc_tensor(response),)
         else:
             assert False, "No media generated"
 
@@ -204,7 +271,8 @@ class ADSD3Sampler:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "config":           ("AD_CONFIG",),
+                "model":            MODEL,
+                "config":           CONFIG,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
                 "width":            RESOLUTION,
@@ -216,34 +284,29 @@ class ADSD3Sampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = IMAGE
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, positive_prompt, negative_prompt, width, height, scheduler, steps, guidance_scale, seed, config):
-        config["pipeline_type"] = "sd3"
-        config["scheduler"] = scheduler
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+        config["pipeline_type"] =   "sd3"
+        config["model"] =           model
+        config["scheduler"] =       scheduler
         launch_host_process(config)
+
         data = {
-            "positive_prompt":  positive_prompt,
-            "negative_prompt":  negative_prompt,
-            "width":            width,
-            "height":           height,
-            "guidance_scale":   guidance_scale,
-            "seed":             seed,
-            "output_path":      outputs_dir,
+            "positive_prompt":      positive_prompt,
+            "negative_prompt":      negative_prompt,
+            "width":                width,
+            "height":               height,
+            "seed":                 seed,
+            "num_inference_steps":  steps,
+            "guidance_scale":       guidance_scale,
         }
-        response = requests.post(host_address_generate, json=data)
-        response_data = response.json()
-        output_base64 = response_data.get("output")
+        response = get_result(data)
         close_host_process()
-        if output_base64:
-            output_bytes = base64.b64decode(output_base64)
-            im2 = pickle.loads(output_bytes)
-            tensor_image = ToTensor()(im2)                      # CHW
-            tensor_image = tensor_image.unsqueeze(0)            # CHW -> NCHW
-            tensor_image = tensor_image.permute(0, 2, 3, 1)     # NCHW -> NHWC
-            return (tensor_image,)
+        if response is not None:
+            return (convert_b64_to_nhwc_tensor(response),)
         else:
             assert False, "No media generated"
 
@@ -253,7 +316,8 @@ class ADSDXLSampler:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "config":           ("AD_CONFIG",),
+                "model":            MODEL,
+                "config":           CONFIG,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
                 "width":            RESOLUTION,
@@ -265,35 +329,29 @@ class ADSDXLSampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = IMAGE
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, positive_prompt, negative_prompt, width, height, scheduler, steps, guidance_scale, seed, config):
-        config["pipeline_type"] = "sdxl"
-        config["scheduler"] = scheduler
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+        config["pipeline_type"] =   "sdxl"
+        config["model"] =           model
+        config["scheduler"] =       scheduler
         launch_host_process(config)
+
         data = {
             "positive_prompt":      positive_prompt,
             "negative_prompt":      negative_prompt,
             "width":                width,
             "height":               height,
+            "seed":                 seed,
             "num_inference_steps":  steps,
             "guidance_scale":       guidance_scale,
-            "seed":                 seed,
-            "output_path":          outputs_dir,
         }
-        response = requests.post(host_address_generate, json=data)
-        response_data = response.json()
-        output_base64 = response_data.get("output")
+        response = get_result(data)
         close_host_process()
-        if output_base64:
-            output_bytes = base64.b64decode(output_base64)
-            im2 = pickle.loads(output_bytes)
-            tensor_image = ToTensor()(im2)                      # CHW
-            tensor_image = tensor_image.unsqueeze(0)            # CHW -> NCHW
-            tensor_image = tensor_image.permute(0, 2, 3, 1)     # NCHW -> NHWC
-            return (tensor_image,)
+        if response is not None:
+            return (convert_b64_to_nhwc_tensor(response),)
         else:
             assert False, "No media generated"
 
@@ -303,8 +361,9 @@ class ADSVDSampler:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "config":               ("AD_CONFIG",),
-                "image":                ("IMAGE",),
+                "model":                MODEL,
+                "config":               CONFIG,
+                "image":                IMAGE,
                 "width":                RESOLUTION,
                 "height":               RESOLUTION,
                 "seed":                 SEED,
@@ -317,60 +376,55 @@ class ADSVDSampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = IMAGE
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
     def generate(
         self,
-        width, height, steps, guidance_scale, seed, decode_chunk_size, num_frames,
-        motion_bucket_id, noise_aug_strength, image, config
+        model, config, image, width, height, seed, steps, guidance_scale,
+        decode_chunk_size, num_frames, motion_bucket_id, noise_aug_strength
     ):
-        config["pipeline_type"] = "svd"
+        config["pipeline_type"] =   "svd"
+        config["model"] =           model
         launch_host_process(config)
+
         image = image.squeeze(0)        # NHWC -> HWC
-        image = image.permute(2, 0, 1)  # HWC -> CHW
-        image = ToPILImage()(image)
-        pickled_image = pickle.dumps(image)
-        b64_image = base64.b64encode(pickled_image).decode("utf-8")
+        b64_image = convert_tensor_to_b64(image)
         data = {
             "image":                b64_image,
             "width":                width,
             "height":               height,
+            "seed":                 seed,
             "num_inference_steps":  steps,
             "guidance_scale":       guidance_scale,
-            "seed":                 seed,
             "decode_chunk_size":    decode_chunk_size,
             "num_frames":           num_frames,
             "motion_bucket_id":     motion_bucket_id,
             "noise_aug_strength":   noise_aug_strength,
-            "output_path":          outputs_dir,
         }
-        response = requests.post(host_address_generate, json=data)
-        response_data = response.json()
-        output_base64 = response_data.get("output")
+        response = get_result(data)
         close_host_process()
-        if output_base64:
+        if response is not None:
             print("Media generated")
-            output_bytes = base64.b64decode(output_base64)
+            output_bytes = base64.b64decode(response)
             images = pickle.loads(output_bytes)
             tensors = []
             for i in images:
-                tensor = ToTensor()(i)              # CHW
-                tensor = tensor.permute(1, 2, 0)    # CHW -> HWC
-                tensors.append(tensor)
+                tensors.append(convert_image_to_hwc_tensor(i))
             return (torch.stack(tuple(tensors)),)   # HWC -> NHWC
         else:
             assert False, "No media generated"
 
 
-class ADUpscaleSampler:
+class ADSDUpscaleSampler:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "config":           ("AD_CONFIG",),
-                "image":            ("IMAGE",),
+                "model":            MODEL,
+                "config":           CONFIG,
+                "image":            IMAGE,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
                 "scheduler":        SCHEDULERS,
@@ -380,48 +434,42 @@ class ADUpscaleSampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
+    RETURN_TYPES = IMAGE
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, config, image, positive_prompt, negative_prompt, scheduler, steps, guidance_scale, seed):
-        config["pipeline_type"] = "sdup"
-        config["scheduler"] = scheduler
+    def generate(self, model, config, image, positive_prompt, negative_prompt, scheduler, seed, steps, guidance_scale):
+        config["pipeline_type"] =   "sdup"
+        config["model"] =           model
+        config["scheduler"] =       scheduler
+        launch_host_process(config)
+
         if image.size(0) > 1:
             images = list(torch.unbind(image, 0))   # NHWC -> [HWC], len == N
         else:
             images = [image.squeeze(0)]             # NHWC -> [HWC], len == 1
         tensors = []
         i = 0
-        launch_host_process(config)
         for im in images:
             i += 1
             print(f"Upscaling image: {i}/{len(images)}")
-            im = im.permute(2, 0, 1)                # HWC -> CHW
-            im = ToPILImage()(im)
-            pickled_image = pickle.dumps(im)
-            b64_image = base64.b64encode(pickled_image).decode("utf-8")
+            b64_image = convert_tensor_to_b64(im)
             data = {
                 "image":                b64_image,
                 "positive_prompt":      positive_prompt,
                 "negative_prompt":      negative_prompt,
+                "seed":                 seed,
                 "num_inference_steps":  steps,
                 "guidance_scale":       guidance_scale,
-                "seed":                 seed,
-                "output_path":          outputs_dir,
             }
 
             try:
-                response = requests.post(host_address_generate, json=data)
-                response_data = response.json()
-                output_base64 = response_data.get("output")
-                if output_base64:
+                response = get_result(data)
+                if response is not None:
                     print(f"Finished upscaling image: {i}/{len(images)}")
-                    output_bytes = base64.b64decode(output_base64)
+                    output_bytes = base64.b64decode(response)
                     im2 = pickle.loads(output_bytes)
-                    tensor_image = ToTensor()(im2)                  # CHW
-                    tensor_image = tensor_image.permute(1, 2, 0)    # CHW -> HWC
-                    tensors.append(tensor_image)
+                    tensors.append(convert_image_to_hwc_tensor(im2))
                 else:
                     if len(images) == 1:
                         print("No media generated")
@@ -454,8 +502,11 @@ def launch_host_process(config):
         f'--variant={config.get("variant")}',
     ]
 
-    if config.get("pipeline_type") in ["sdup"]:
+    if config.get("pipeline_type") in ["sd1", "sd2", "sd3", "sdup", "sdxl"]:
         cmd.append(f'--scheduler={config.get("scheduler")}')
+
+    if config.get("pipeline_type") in ["ad"]:
+        cmd.append(f'--motion_adapter={checkpoints_dir}/{config.get("motion_adapter")}')
 
     if config.get("scale_input"):
         cmd.append('--scale_input')
@@ -499,23 +550,59 @@ def close_host_process():
     return
 
 
+def get_result(data):
+    data["output_path"] = outputs_dir
+    response = requests.post(host_address_generate, json=data)
+    response_data = response.json()
+    output_base64 = response_data.get("output")
+    return output_base64
+
+
+def convert_b64_to_nhwc_tensor(b64):
+    output_bytes = base64.b64decode(b64)
+    im2 = pickle.loads(output_bytes)
+    tensor_image = ToTensor()(im2)                      # CHW
+    tensor_image = tensor_image.unsqueeze(0)            # CHW -> NCHW
+    tensor_image = tensor_image.permute(0, 2, 3, 1)     # NCHW -> NHWC
+    return tensor_image
+
+
+def convert_image_to_hwc_tensor(image):
+    tensor = ToTensor()(image)          # CHW
+    tensor = tensor.permute(1, 2, 0)    # CHW -> HWC
+    return tensor
+
+
+def convert_tensor_to_b64(tensor):
+    im = tensor.permute(2, 0, 1)        # HWC -> CHW
+    im = ToPILImage()(im)
+    pickled_image = pickle.dumps(im)
+    b64_image = base64.b64encode(pickled_image).decode("utf-8")
+    return b64_image
+
+
 NODE_CLASS_MAPPINGS = {
-    "ADPipelineConfig": ADPipelineConfig,
-    "ADSD1Sampler":     ADSD1Sampler,
-    "ADSD2Sampler":     ADSD2Sampler,
-    "ADSD3Sampler":     ADSD3Sampler,
-    "ADSDXLSampler":    ADSDXLSampler,
-    "ADSVDSampler":     ADSVDSampler,
-    "ADUpscaleSampler": ADUpscaleSampler,
+    "ADADSampler":          ADADSampler,
+    "ADModelSelector":      ADModelSelector,
+    "ADPipelineConfig":     ADPipelineConfig,
+    "ADSD1Sampler":         ADSD1Sampler,
+    "ADSD2Sampler":         ADSD2Sampler,
+    "ADSD3Sampler":         ADSD3Sampler,
+    "ADSDUpscaleSampler":   ADSDUpscaleSampler,
+    "ADSDXLSampler":        ADSDXLSampler,
+    "ADSVDSampler":         ADSVDSampler,
+    
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ADPipelineConfig": "ADPipelineConfig",
-    "ADSD1Sampler":     "ADSD1Sampler",
-    "ADSD2Sampler":     "ADSD2Sampler",
-    "ADSD3Sampler":     "ADSD3Sampler",
-    "ADSDXLSampler":    "ADSDXLSampler",
-    "ADSVDSampler":     "ADSVDSampler",
-    "ADUpscaleSampler": "ADUpscaleSampler",
+    "ADADSampler":          "ADADSampler",
+    "ADModelSelector":      "ADModelSelector",
+    "ADPipelineConfig":     "ADPipelineConfig",
+    "ADSD1Sampler":         "ADSD1Sampler",
+    "ADSD2Sampler":         "ADSD2Sampler",
+    "ADSD3Sampler":         "ADSD3Sampler",
+    "ADSDUpscaleSampler":   "ADSDUpscaleSampler",
+    "ADSDXLSampler":        "ADSDXLSampler",
+    "ADSVDSampler":         "ADSVDSampler",
 }

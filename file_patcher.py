@@ -1,7 +1,24 @@
 files_to_patch = [
     {
+        "file_name": "AsyncDiff/asyncdiff/async_animate.py",
+        "replace": [
+            # Modify constructor to take pipeline_type as an argument
+            # so that we can define it, instead of using the model name
+            {
+                "from": "def __init__(self, pipeline, model_n=2, stride=1, warm_up=1, time_shift=False):",
+                "to":   "def __init__(self, pipeline, pipeline_type, model_n=2, stride=1, warm_up=1, time_shift=False):",
+            },
+            {
+                "from": "self.pipe_id = pipeline.config._name_or_path",
+                "to":   "self.pipe_id = pipeline_type",
+            },
+        ],
+    },
+    {
         "file_name": "AsyncDiff/asyncdiff/async_sd.py",
         "replace": [
+            # Modify constructor to take pipeline_type as an argument
+            # so that we can define it, instead of using the model name
             {
                 "from": "def __init__(self, pipeline, model_n=2, stride=1, warm_up=1, time_shift=False):",
                 "to":   "def __init__(self, pipeline, pipeline_type, model_n=2, stride=1, warm_up=1, time_shift=False):",
@@ -15,6 +32,7 @@ files_to_patch = [
     {
         "file_name": "AsyncDiff/asyncdiff/pipe_config.py",
         "replace": [
+            # Change all model names to their corresponding pipeline_type
             {
                 "from": "stabilityai/stable-diffusion-3-medium-diffusers",
                 "to":   "sd3",
@@ -42,6 +60,11 @@ files_to_patch = [
             {
                 "from": "stabilityai/stable-diffusion-x4-upscaler",
                 "to":   "sdup",
+            },
+            # Fix tuple @ line 355
+            {
+                "from": "unet.up_blocks[2]   ",
+                "to": "unet.up_blocks[2],",
             },
         ],
     },
