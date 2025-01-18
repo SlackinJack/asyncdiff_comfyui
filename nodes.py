@@ -7,6 +7,7 @@ import requests
 import subprocess
 import time
 import torch
+from glob import glob
 from pathlib import Path
 from PIL import Image
 from torchvision.transforms import ToPILImage, ToTensor
@@ -22,14 +23,20 @@ cwd = os.path.dirname(__file__)
 comfy_root = os.path.dirname(os.path.dirname(cwd))
 models_dir = os.path.join(os.path.join(comfy_root, "models"))
 checkpoints_dir = os.path.join(models_dir, "checkpoints")
+loras_dir = os.path.join(models_dir, "loras")
 outputs_dir = os.path.join(comfy_root, "output")
 models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
+model_extensions = ["bin", "safetensors"]
+loras = [f for path in os.walk(loras_dir) for f in glob(os.path.join(path[0], '**/*.*'), recursive=True) if f.split(".")[1] in model_extensions]
 
 
 INT_MAX = 2 ** 32 - 1
+INT_MIN = -1 * INT_MAX
 BOOLEAN_DEFAULT_FALSE = ("BOOLEAN", { "default": False })
 CONFIG =                ("AD_CONFIG",)
 IMAGE =                 ("IMAGE",)
+LORA =                  ("AD_LORA",)
+LORA_LIST =             (loras,)
 MODEL =                 ("AD_MODEL",)
 MODEL_LIST =            (models,)
 
@@ -38,22 +45,23 @@ SCHEDULERS = (
     list(["ddim", "euler", "euler_a", "dpm_2", "dpm_2_a", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_sde", "heun", "lms", "pndm", "unipc"]),
     { "default": "dpmpp_2m" }
 )
-VARIANT =           (["bf16", "fp16", "fp32"],  { "default": "fp16" })
-MODEL_N =           ("INT",                     { "default": 2,     "min": 2,       "max": 4,       "step": 1 })
-STRIDE =            ("INT",                     { "default": 1,     "min": 1,       "max": 2,       "step": 1 })
-NPROC_PER_NODE =    ("INT",                     { "default": 2,     "min": 1,       "max": 4,       "step": 1 })
-SCALE_PERCENTAGE =  ("FLOAT",                   { "default": 75.0,  "min": 0.01,    "max": INT_MAX, "step": 0.01 })
+VARIANT =               (["bf16", "fp16", "fp32"],  { "default": "fp16" })
+MODEL_N =               ("INT",                     { "default": 2,     "min": 2,       "max": 4,       "step": 1 })
+STRIDE =                ("INT",                     { "default": 1,     "min": 1,       "max": 2,       "step": 1 })
+NPROC_PER_NODE =        ("INT",                     { "default": 2,     "min": 1,       "max": 4,       "step": 1 })
+SCALE_PERCENTAGE =      ("FLOAT",                   { "default": 75.0,  "min": 0.01,    "max": INT_MAX, "step": 0.01 })
 
 
-PROMPT =                ("STRING",  { "default": "",    "multiline": True })
-RESOLUTION =            ("INT",     { "default": 512,   "min": 8,   "max": INT_MAX, "step": 8 })
-SEED =                  ("INT",     { "default": 0,     "min": 0,   "max": INT_MAX, "step": 1 })
-STEPS =                 ("INT",     { "default": 60,    "min": 1,   "max": INT_MAX, "step": 1 })
-DECODE_CHUNK_SIZE =     ("INT",     { "default": 8,     "min": 1,   "max": INT_MAX, "step": 1 })
-NUM_FRAMES =            ("INT",     { "default": 25,    "min": 1,   "max": INT_MAX, "step": 1 })
-MOTION_BUCKET_ID =      ("INT",     { "default": 180,   "min": 1,   "max": INT_MAX, "step": 1 })
-CFG =                   ("FLOAT",   { "default": 3.5,   "min": 0,   "max": INT_MAX, "step": 0.1 })
-NOISE_AUG_STRENGTH =    ("FLOAT",   { "default": 0.01,  "min": 0,   "max": INT_MAX, "step": 0.01 })
+PROMPT =                ("STRING",                  { "default": "",    "multiline": True })
+RESOLUTION =            ("INT",                     { "default": 512,   "min": 8,       "max": INT_MAX, "step": 8 })
+SEED =                  ("INT",                     { "default": 0,     "min": 0,       "max": INT_MAX, "step": 1 })
+STEPS =                 ("INT",                     { "default": 60,    "min": 1,       "max": INT_MAX, "step": 1 })
+DECODE_CHUNK_SIZE =     ("INT",                     { "default": 8,     "min": 1,       "max": INT_MAX, "step": 1 })
+NUM_FRAMES =            ("INT",                     { "default": 25,    "min": 1,       "max": INT_MAX, "step": 1 })
+MOTION_BUCKET_ID =      ("INT",                     { "default": 180,   "min": 1,       "max": INT_MAX, "step": 1 })
+CFG =                   ("FLOAT",                   { "default": 3.5,   "min": 0,       "max": INT_MAX, "step": 0.1 })
+NOISE_AUG_STRENGTH =    ("FLOAT",                   { "default": 0.01,  "min": 0,       "max": INT_MAX, "step": 0.01 })
+LORA_WEIGHT =           ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
 
 
 class ADModelSelector:
@@ -67,6 +75,36 @@ class ADModelSelector:
 
     def get_model(self, model):
         return (model,)
+
+
+class ADLoraSelector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "required": { "lora": LORA_LIST, "weight": LORA_WEIGHT } }
+
+    RETURN_TYPES = LORA
+    FUNCTION = "get_lora_with_weight"
+    CATEGORY = "AsyncDiff"        
+
+    def get_lora_with_weight(self, lora, weight):
+        return ([{ "lora": lora, "weight": weight }],)
+
+
+class ADMultiLoraSelector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "optional": { "lora_1": LORA, "lora_2": LORA, "lora_3": LORA, "lora_4": LORA } }
+
+    RETURN_TYPES = LORA
+    FUNCTION = "get_multi_lora"
+    CATEGORY = "AsyncDiff"        
+
+    def get_multi_lora(self, **kwargs):
+        loras = []
+        for k, v in kwargs.items():
+            for lora in v:
+                loras.append({ "lora": lora.get("lora"), "weight": lora.get("weight") })
+        return (loras,)
 
 
 class ADPipelineConfig:
@@ -191,6 +229,9 @@ class ADSD1Sampler:
                 "seed":             SEED,
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
+            },
+            "optional": {
+                "lora":             LORA,
             }
         }
 
@@ -198,10 +239,12 @@ class ADSD1Sampler:
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
         config["pipeline_type"] =   "sd1"
         config["model"] =           model
         config["scheduler"] =       scheduler
+        if lora is not None:
+            config["lora"] = lora
         launch_host_process(config)
 
         data = {
@@ -236,6 +279,9 @@ class ADSD2Sampler:
                 "seed":             SEED,
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
+            },
+            "optional": {
+                "lora":             LORA,
             }
         }
 
@@ -243,10 +289,12 @@ class ADSD2Sampler:
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
         config["pipeline_type"] =   "sd2"
         config["model"] =           model
         config["scheduler"] =       scheduler
+        if lora is not None:
+            config["lora"] = lora
         launch_host_process(config)
 
         data = {
@@ -281,6 +329,9 @@ class ADSD3Sampler:
                 "seed":             SEED,
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
+            },
+            "optional": {
+                "lora":             LORA,
             }
         }
 
@@ -288,10 +339,12 @@ class ADSD3Sampler:
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
         config["pipeline_type"] =   "sd3"
         config["model"] =           model
         config["scheduler"] =       scheduler
+        if lora is not None:
+            config["lora"] = lora
         launch_host_process(config)
 
         data = {
@@ -326,6 +379,9 @@ class ADSDXLSampler:
                 "seed":             SEED,
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
+            },
+            "optional": {
+                "lora":            LORA,
             }
         }
 
@@ -333,10 +389,12 @@ class ADSDXLSampler:
     FUNCTION = "generate"
     CATEGORY = "AsyncDiff"
 
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale):
+    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
         config["pipeline_type"] =   "sdxl"
         config["model"] =           model
         config["scheduler"] =       scheduler
+        if lora is not None:
+            config["lora"] = lora
         launch_host_process(config)
 
         data = {
@@ -512,6 +570,9 @@ def launch_host_process(config):
         cmd.append('--scale_input')
         cmd.append(f'--scale_percentage={config.get("scale_percentage")}')
 
+    if config.get("lora"):
+        cmd.append(f'--lora={json.dumps(config.get("lora"))}')
+
     if config.get("enable_model_cpu_offload"):
         cmd.append('--enable_model_cpu_offload')
 
@@ -583,7 +644,9 @@ def convert_tensor_to_b64(tensor):
 
 NODE_CLASS_MAPPINGS = {
     "ADADSampler":          ADADSampler,
+    "ADLoraSelector":       ADLoraSelector,
     "ADModelSelector":      ADModelSelector,
+    "ADMultiLoraSelector":  ADMultiLoraSelector,
     "ADPipelineConfig":     ADPipelineConfig,
     "ADSD1Sampler":         ADSD1Sampler,
     "ADSD2Sampler":         ADSD2Sampler,
@@ -597,7 +660,9 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ADADSampler":          "ADADSampler",
+    "ADLoraSelector":       "ADLoraSelector",
     "ADModelSelector":      "ADModelSelector",
+    "ADMultiLoraSelector":  "ADMultiLoraSelector",
     "ADPipelineConfig":     "ADPipelineConfig",
     "ADSD1Sampler":         "ADSD1Sampler",
     "ADSD2Sampler":         "ADSD2Sampler",

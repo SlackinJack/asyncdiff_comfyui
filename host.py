@@ -106,6 +106,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--motion_adapter", type=str, default=None)
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [bf16/fp16/fp32]")
     parser.add_argument("--scheduler", type=str, default="ddim")
+    parser.add_argument("--lora", type=str, default=None, help="A dictionary of LoRAs to load, with their weights")
     parser.add_argument("--enable_model_cpu_offload", action="store_true")
     parser.add_argument("--enable_sequential_cpu_offload", action="store_true")
     parser.add_argument("--enable_tiling", action="store_true")
@@ -166,12 +167,14 @@ def initialize():
                 args.motion_adapter,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
             pipe = AnimateDiffPipeline.from_pretrained(
                 args.model,
                 motion_adapter=adapter,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
             scheduler = DDIMScheduler.from_pretrained(
                 args.model,
@@ -180,6 +183,7 @@ def initialize():
                 timestep_spacing="linspace",
                 beta_schedule="linear",
                 steps_offset=1,
+                local_files_only=True,
             )
             pipe.scheduler = scheduler
         case "sd1":
@@ -187,36 +191,42 @@ def initialize():
                 args.model,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
         case "sd2":
             pipe = StableDiffusionPipeline.from_pretrained(
                 args.model,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
         case "sd3":
             pipe = StableDiffusion3Pipeline.from_pretrained(
                 args.model,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
         case "sdup":
             pipe = StableDiffusionUpscalePipeline.from_pretrained(
                 args.model,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
         case "sdxl":
             pipe = StableDiffusionXLPipeline.from_pretrained(
                 args.model,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
         case "svd":
             pipe = StableVideoDiffusionPipeline.from_pretrained(
                 args.model,
                 torch_dtype=torch_dtype,
                 use_safetensors=True,
+                local_files_only=True,
             )
         case _: raise NotImplementedError
 
@@ -241,6 +251,26 @@ def initialize():
         )
 
     pipe.set_progress_bar_config(disable=dist.get_rank() != 0)
+
+    if args.lora is not None and args.pipeline_type in ["sd1", "sd2", "sd3", "sdxl"]:
+        loras = json.loads(args.lora)
+        lora_names = []
+        lora_weights = []
+        pipe.enable_lora()
+        i = 0
+        if str(local_rank) == "0":
+            print("#################### MODEL LAYOUT:\n" + str(pipe.unet))
+        for entry in loras:
+            lora_path = entry.get("lora")
+            lora_weight = entry.get("weight")
+            print(f'Loading LoRA with weight {lora_weight}: {lora_path}')
+            lora_name = str(i)
+            lora_names.append(lora_name)
+            lora_weights.append(lora_weight)
+            pipe.load_lora_weights(lora_path, weight_name=lora_name, adapter_name=lora_name)
+            i += 1
+        pipe.set_adapters(lora_names, lora_weights)
+        pipe.fuse_lora()
 
     if args.pipeline_type != "svd":
         if args.enable_slicing:
@@ -307,10 +337,9 @@ def generate_image_parallel(
     motion_bucket_id, noise_aug_strength, output_path,
 ):
     global pipe, async_diff
+    args = get_args()
     torch.cuda.reset_peak_memory_stats()
     start_time = time.time()
-    args = get_args()
-
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     async_diff.reset_state(warm_up=args.warm_up)
@@ -330,6 +359,17 @@ def generate_image_parallel(
 
     match args.pipeline_type:
         case "ad":
+            logger.info(
+                "Request parameters:\n"
+                f"positive_prompt={positive_prompt}\n"
+                f"negative_prompt={negative_prompt}\n"
+                f"width={width}\n"
+                f"height={height}\n"
+                f"steps={num_inference_steps}\n"
+                f"cfg={cfg}\n"
+                f"seed={seed}\n"
+                f"num_frames={num_frames}\n"
+            )
             output = pipe(
                 prompt=positive_prompt,
                 negative_prompt=negative_prompt,
@@ -341,6 +381,14 @@ def generate_image_parallel(
                 output_type="pil",
             ).frames[0]
         case "sdup":
+            logger.info(
+                "Request parameters:\n"
+                f"positive_prompt={positive_prompt}\n"
+                f"negative_prompt={negative_prompt}\n"
+                f"steps={num_inference_steps}\n"
+                f"cfg={cfg}\n"
+                f"seed={seed}\n"
+            )
             output = pipe(
                 prompt=positive_prompt,
                 negative_prompt=negative_prompt,
@@ -350,6 +398,18 @@ def generate_image_parallel(
                 output_type="pil",
             ).images[0]
         case "svd":
+            logger.info(
+                "Request parameters:\n"
+                f"width={width}\n"
+                f"height={height}\n"
+                f"steps={num_inference_steps}\n"
+                f"cfg={cfg}\n"
+                f"seed={seed}\n"
+                f"num_frames={num_frames}\n"
+                f"decode_chunk_size={decode_chunk_size}\n"
+                f"motion_bucket_id={motion_bucket_id}\n"
+                f"noise_aug_strength={noise_aug_strength}\n"
+            )
             output = pipe(
                 image,
                 width=width,
@@ -363,9 +423,21 @@ def generate_image_parallel(
                 output_type="pil",
             ).frames[0]
         case _:
+            logger.info(
+                "Request parameters:\n"
+                f"positive_prompt={positive_prompt}\n"
+                f"negative_prompt={negative_prompt}\n"
+                f"width={width}\n"
+                f"height={height}\n"
+                f"steps={num_inference_steps}\n"
+                f"cfg={cfg}\n"
+                f"seed={seed}\n"
+            )
             output = pipe(
                 prompt=positive_prompt,
                 negative_prompt=negative_prompt,
+                width=width,
+                height=height,
                 num_inference_steps=num_inference_steps,
                 guidance_scale=cfg,
                 output_type="pil",
@@ -419,23 +491,6 @@ def generate_image():
         elif args.host_mode == "comfyui":
             image = base64.b64decode(image)
             image = pickle.loads(image)
-
-    logger.info(
-        "Request parameters:\n"
-        # f"image={image}\n"
-        f"positive_prompt={positive_prompt}\n"
-        f"negative_prompt={negative_prompt}\n"
-        f"width={width}\n"
-        f"height={height}\n"
-        f"steps={num_inference_steps}\n"
-        f"cfg={guidance_scale}\n"
-        f"seed={seed}\n"
-        f"num_frames={num_frames}\n"
-        f"decode_chunk_size={decode_chunk_size}\n"
-        f"motion_bucket_id={motion_bucket_id}\n"
-        f"noise_aug_strength={noise_aug_strength}\n"
-        f"output_path={output_path}"
-    )
 
     # Broadcast request parameters to all processes
     params = [
