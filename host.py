@@ -10,7 +10,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from compel import Compel, ReturnedEmbeddingsType
 from flask import Flask, request, jsonify
 from PIL import Image
 
@@ -107,6 +106,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--variant", type=str, default="fp16", help="PyTorch variant [bf16/fp16/fp32]")
     parser.add_argument("--scheduler", type=str, default="ddim")
     parser.add_argument("--lora", type=str, default=None, help="A dictionary of LoRAs to load, with their weights")
+    parser.add_argument("--ip_adapter", type=str, default=None, help="IPAdapter model")
+    parser.add_argument("--ip_adapter_scale", type=float, default=1.0, help="IPAdapter scale")
     parser.add_argument("--enable_model_cpu_offload", action="store_true")
     parser.add_argument("--enable_sequential_cpu_offload", action="store_true")
     parser.add_argument("--enable_tiling", action="store_true")
@@ -176,6 +177,18 @@ def initialize():
                 use_safetensors=True,
                 local_files_only=True,
             )
+            if args.ip_adapter is not None:
+                split = args.ip_adapter.split("/")
+                ip_adapter_file = split[-1]
+                ip_adapter_subfolder = split[-2]
+                ip_adapter_folder = args.ip_adapter.replace(f'/{ip_adapter_subfolder}/{ip_adapter_file}', "")
+                pipe.load_ip_adapter(
+                    ip_adapter_folder,
+                    subfolder=ip_adapter_subfolder,
+                    weight_name=ip_adapter_file,
+                    local_files_only=True,
+                )
+                pipe.set_ip_adapter_scale(args.ip_adapter_scale)
             scheduler = DDIMScheduler.from_pretrained(
                 args.model,
                 subfolder="scheduler",
@@ -258,8 +271,6 @@ def initialize():
         lora_weights = []
         pipe.enable_lora()
         i = 0
-        if str(local_rank) == "0":
-            print("#################### MODEL LAYOUT:\n" + str(pipe.unet))
         for entry in loras:
             lora_path = entry.get("lora")
             lora_weight = entry.get("weight")
@@ -287,6 +298,7 @@ def initialize():
     # warm up
     logger.info("Starting warmup run")
     def get_warmup_image():
+        # TODO: make this local so that the node runs completely offline
         image = load_image("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/svd/rocket.png?download=true")
         image = image.resize((512, 288))
         return image
@@ -295,13 +307,23 @@ def initialize():
     async_diff.reset_state(warm_up=args.warm_up)
     match args.pipeline_type:
         case "ad":
-            pipe(
-                prompt="test",
-                negative_prompt="blurry",
-                num_frames=15,
-                guidance_scale=3.5,
-                num_inference_steps=10,
-            )
+            if args.ip_adapter is None:
+                pipe(
+                    prompt="test",
+                    negative_prompt="blurry",
+                    num_frames=15,
+                    guidance_scale=3.5,
+                    num_inference_steps=10,
+                )
+            else:
+                pipe(
+                    prompt="test",
+                    negative_prompt="blurry",
+                    ip_adapter_image=get_warmup_image(),
+                    num_frames=15,
+                    guidance_scale=3.5,
+                    num_inference_steps=10,
+                )
         case "sdup":
             pipe(
                 prompt="detailed",
@@ -322,6 +344,8 @@ def initialize():
                 prompt="test",
                 negative_prompt="blurry",
                 num_inference_steps=10,
+                width=320,
+                height=320,
             )
 
     torch.cuda.empty_cache()
@@ -344,7 +368,7 @@ def generate_image_parallel(
     torch.cuda.manual_seed_all(seed)
     async_diff.reset_state(warm_up=args.warm_up)
 
-    if args.pipeline_type in ["sdup", "svd"]:
+    if (args.pipeline_type in ["sdup", "svd"]) or (args.pipeline_type == "ad" and args.ip_adapter is not None):
         assert image is not None, "No image provided for an image pipeline."
         image = load_image(image)
         if args.scale_input:
@@ -359,30 +383,56 @@ def generate_image_parallel(
 
     match args.pipeline_type:
         case "ad":
-            logger.info(
-                "Request parameters:\n"
-                f"positive_prompt={positive_prompt}\n"
-                f"negative_prompt={negative_prompt}\n"
-                f"width={width}\n"
-                f"height={height}\n"
-                f"steps={num_inference_steps}\n"
-                f"cfg={cfg}\n"
-                f"seed={seed}\n"
-                f"num_frames={num_frames}\n"
-            )
-            output = pipe(
-                prompt=positive_prompt,
-                negative_prompt=negative_prompt,
-                width=width,
-                height=height,
-                num_inference_steps=num_inference_steps,
-                guidance_scale=cfg,
-                num_frames=num_frames,
-                output_type="pil",
-            ).frames[0]
+            if args.ip_adapter is not None and image is not None:
+                logger.info(
+                    "Request parameters:\n"
+                    f"image provided\n"
+                    f"positive_prompt={positive_prompt}\n"
+                    f"negative_prompt={negative_prompt}\n"
+                    f"width={width}\n"
+                    f"height={height}\n"
+                    f"steps={num_inference_steps}\n"
+                    f"cfg={cfg}\n"
+                    f"seed={seed}\n"
+                    f"num_frames={num_frames}\n"
+                )
+                output = pipe(
+                    prompt=positive_prompt,
+                    negative_prompt=negative_prompt,
+                    ip_adapter_image=image,
+                    width=width,
+                    height=height,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=cfg,
+                    num_frames=num_frames,
+                    output_type="pil",
+                ).frames[0]
+            else:
+                logger.info(
+                    "Request parameters:\n"
+                    f"positive_prompt={positive_prompt}\n"
+                    f"negative_prompt={negative_prompt}\n"
+                    f"width={width}\n"
+                    f"height={height}\n"
+                    f"steps={num_inference_steps}\n"
+                    f"cfg={cfg}\n"
+                    f"seed={seed}\n"
+                    f"num_frames={num_frames}\n"
+                )
+                output = pipe(
+                    prompt=positive_prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    num_inference_steps=num_inference_steps,
+                    guidance_scale=cfg,
+                    num_frames=num_frames,
+                    output_type="pil",
+                ).frames[0]
         case "sdup":
             logger.info(
                 "Request parameters:\n"
+                f"image provided\n"
                 f"positive_prompt={positive_prompt}\n"
                 f"negative_prompt={negative_prompt}\n"
                 f"steps={num_inference_steps}\n"
@@ -400,6 +450,7 @@ def generate_image_parallel(
         case "svd":
             logger.info(
                 "Request parameters:\n"
+                f"image provided\n"
                 f"width={width}\n"
                 f"height={height}\n"
                 f"steps={num_inference_steps}\n"
@@ -539,15 +590,12 @@ def run_host():
             if params[0] is None:
                 logger.info("Received exit signal, shutting down")
                 break
-            logger.info(f"Received task with parameters: {params}")
+            # logger.info(f"Received task with parameters: {params}")
             generate_image_parallel(*params)
 
 
 if __name__ == "__main__":
     initialize()
-
-    logger.info(
-        f"Process initialized. Rank: {dist.get_rank()}, Local Rank: {os.environ.get('LOCAL_RANK', 'Not Set')}"
-    )
+    logger.info(f"Process initialized. Rank: {dist.get_rank()}, Local Rank: {os.environ.get('LOCAL_RANK', 'Not Set')}")
     logger.info(f"Available GPUs: {torch.cuda.device_count()}")
     run_host()

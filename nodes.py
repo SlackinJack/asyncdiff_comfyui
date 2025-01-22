@@ -13,55 +13,87 @@ from PIL import Image
 from torchvision.transforms import ToPILImage, ToTensor
 
 
-host_address = 'http://localhost:6000'
-host_process = None
-host_address_generate = f'{host_address}/generate'
+host_address            = 'http://localhost:6000'
+host_process            = None
+host_address_generate   = f'{host_address}/generate'
 host_address_initialize = f'{host_address}/initialize'
+connection_attempts_max = 60
 
 
-cwd = os.path.dirname(__file__)
-comfy_root = os.path.dirname(os.path.dirname(cwd))
-models_dir = os.path.join(os.path.join(comfy_root, "models"))
+cwd             = os.path.dirname(__file__)
+comfy_root      = os.path.dirname(os.path.dirname(cwd))
+outputs_dir     = os.path.join(comfy_root, "output")
+models_dir      = os.path.join(os.path.join(comfy_root, "models"))
 checkpoints_dir = os.path.join(models_dir, "checkpoints")
-loras_dir = os.path.join(models_dir, "loras")
-outputs_dir = os.path.join(comfy_root, "output")
-models = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
-model_extensions = ["bin", "safetensors"]
-loras = [f for path in os.walk(loras_dir) for f in glob(os.path.join(path[0], '**/*.*'), recursive=True) if f.split(".")[1] in model_extensions]
+models          = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
 
 
-INT_MAX = 2 ** 32 - 1
-INT_MIN = -1 * INT_MAX
-BOOLEAN_DEFAULT_FALSE = ("BOOLEAN", { "default": False })
-CONFIG =                ("AD_CONFIG",)
-IMAGE =                 ("IMAGE",)
-LORA =                  ("AD_LORA",)
-LORA_LIST =             (loras,)
-MODEL =                 ("AD_MODEL",)
-MODEL_LIST =            (models,)
+def getModelSubfolder(folderIn):
+    model_extensions = ["bin", "safetensors"]
+    out = []
+    for path in os.walk(folderIn):
+        for f in glob(os.path.join(path[0], '**/*.*'), recursive=True):
+            if f.split(".")[-1] in model_extensions:
+                out.append(f.replace(folderIn + "/", ""))
+    return out
+
+
+loras_dir       = os.path.join(models_dir, "loras")
+loras           = getModelSubfolder(loras_dir)
+ipadapter_dir   = os.path.join(models_dir, "ipadapter")
+ipadapters      = getModelSubfolder(ipadapter_dir)
+
+
+INT_MAX                 = 2 ** 32 - 1
+INT_MIN                 = -1 * INT_MAX
+BOOLEAN_DEFAULT_FALSE   = ("BOOLEAN", { "default": False })
+CONFIG                  = ("AD_CONFIG",)
+IMAGE                   = ("IMAGE",)
+LORA                    = ("AD_LORA",)
+LORA_LIST               = (loras,)
+MODEL                   = ("AD_MODEL",)
+MODEL_LIST              = (models,)
+IPADAPTER               = ("AD_IPADAPTER",)
+IPADAPTER_LIST          = (ipadapters,)
 
 
 SCHEDULERS = (
-    list(["ddim", "euler", "euler_a", "dpm_2", "dpm_2_a", "dpmpp_2m", "dpmpp_2m_sde", "dpmpp_sde", "heun", "lms", "pndm", "unipc"]),
-    { "default": "dpmpp_2m" }
+    list([
+        "ddim",
+        "euler",
+        "euler_a",
+        "dpm_2",
+        "dpm_2_a",
+        "dpmpp_2m",
+        "dpmpp_2m_sde",
+        "dpmpp_sde",
+        "heun",
+        "lms",
+        "pndm",
+        "unipc"
+    ]),
+    {
+        "default": "dpmpp_2m"
+    }
 )
-VARIANT =               (["bf16", "fp16", "fp32"],  { "default": "fp16" })
-MODEL_N =               ("INT",                     { "default": 2,     "min": 2,       "max": 4,       "step": 1 })
-STRIDE =                ("INT",                     { "default": 1,     "min": 1,       "max": 2,       "step": 1 })
-NPROC_PER_NODE =        ("INT",                     { "default": 2,     "min": 1,       "max": 4,       "step": 1 })
-SCALE_PERCENTAGE =      ("FLOAT",                   { "default": 75.0,  "min": 0.01,    "max": INT_MAX, "step": 0.01 })
+VARIANT                 = (["bf16", "fp16", "fp32"],  { "default": "fp16" })
+MODEL_N                 = ("INT",                     { "default": 2,     "min": 2,       "max": 4,       "step": 1 })
+STRIDE                  = ("INT",                     { "default": 1,     "min": 1,       "max": 2,       "step": 1 })
+NPROC_PER_NODE          = ("INT",                     { "default": 2,     "min": 1,       "max": 4,       "step": 1 })
+SCALE_PERCENTAGE        = ("FLOAT",                   { "default": 75.0,  "min": 0.01,    "max": INT_MAX, "step": 0.01 })
 
 
-PROMPT =                ("STRING",                  { "default": "",    "multiline": True })
-RESOLUTION =            ("INT",                     { "default": 512,   "min": 8,       "max": INT_MAX, "step": 8 })
-SEED =                  ("INT",                     { "default": 0,     "min": 0,       "max": INT_MAX, "step": 1 })
-STEPS =                 ("INT",                     { "default": 60,    "min": 1,       "max": INT_MAX, "step": 1 })
-DECODE_CHUNK_SIZE =     ("INT",                     { "default": 8,     "min": 1,       "max": INT_MAX, "step": 1 })
-NUM_FRAMES =            ("INT",                     { "default": 25,    "min": 1,       "max": INT_MAX, "step": 1 })
-MOTION_BUCKET_ID =      ("INT",                     { "default": 180,   "min": 1,       "max": INT_MAX, "step": 1 })
-CFG =                   ("FLOAT",                   { "default": 3.5,   "min": 0,       "max": INT_MAX, "step": 0.1 })
-NOISE_AUG_STRENGTH =    ("FLOAT",                   { "default": 0.01,  "min": 0,       "max": INT_MAX, "step": 0.01 })
-LORA_WEIGHT =           ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
+PROMPT                  = ("STRING",                  { "default": "",    "multiline": True })
+RESOLUTION              = ("INT",                     { "default": 512,   "min": 8,       "max": INT_MAX, "step": 8 })
+SEED                    = ("INT",                     { "default": 0,     "min": 0,       "max": INT_MAX, "step": 1 })
+STEPS                   = ("INT",                     { "default": 60,    "min": 1,       "max": INT_MAX, "step": 1 })
+DECODE_CHUNK_SIZE       = ("INT",                     { "default": 8,     "min": 1,       "max": INT_MAX, "step": 1 })
+NUM_FRAMES              = ("INT",                     { "default": 25,    "min": 1,       "max": INT_MAX, "step": 1 })
+MOTION_BUCKET_ID        = ("INT",                     { "default": 180,   "min": 1,       "max": INT_MAX, "step": 1 })
+CFG                     = ("FLOAT",                   { "default": 3.5,   "min": 0,       "max": INT_MAX, "step": 0.1 })
+NOISE_AUG_STRENGTH      = ("FLOAT",                   { "default": 0.01,  "min": 0,       "max": INT_MAX, "step": 0.01 })
+LORA_WEIGHT             = ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
+IP_ADAPTER_SCALE        = ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
 
 
 class ADModelSelector:
@@ -69,9 +101,9 @@ class ADModelSelector:
     def INPUT_TYPES(s):
         return { "required": { "model": MODEL_LIST } }
 
-    RETURN_TYPES = MODEL
-    FUNCTION = "get_model"
-    CATEGORY = "AsyncDiff"        
+    RETURN_TYPES    = MODEL
+    FUNCTION        = "get_model"
+    CATEGORY        = "AsyncDiff"        
 
     def get_model(self, model):
         return (model,)
@@ -82,12 +114,25 @@ class ADLoraSelector:
     def INPUT_TYPES(s):
         return { "required": { "lora": LORA_LIST, "weight": LORA_WEIGHT } }
 
-    RETURN_TYPES = LORA
-    FUNCTION = "get_lora_with_weight"
-    CATEGORY = "AsyncDiff"        
+    RETURN_TYPES    = LORA
+    FUNCTION        = "get_lora_with_weight"
+    CATEGORY        = "AsyncDiff"        
 
     def get_lora_with_weight(self, lora, weight):
-        return ([{ "lora": lora, "weight": weight }],)
+        return ([{ "lora": loras_dir + "/" + lora, "weight": weight }],)
+
+
+class ADIPAdapterSelector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "required": { "ip_adapter": IPADAPTER_LIST, "scale": IP_ADAPTER_SCALE } }
+
+    RETURN_TYPES    = IPADAPTER
+    FUNCTION        = "get_ipadapter_with_scale"
+    CATEGORY        = "AsyncDiff"        
+
+    def get_ipadapter_with_scale(self, ip_adapter, scale):
+        return ({ "ip_adapter": ip_adapter, "scale": scale },)
 
 
 class ADMultiLoraSelector:
@@ -95,9 +140,9 @@ class ADMultiLoraSelector:
     def INPUT_TYPES(s):
         return { "optional": { "lora_1": LORA, "lora_2": LORA, "lora_3": LORA, "lora_4": LORA } }
 
-    RETURN_TYPES = LORA
-    FUNCTION = "get_multi_lora"
-    CATEGORY = "AsyncDiff"        
+    RETURN_TYPES    = LORA
+    FUNCTION        = "get_multi_lora"
+    CATEGORY        = "AsyncDiff"        
 
     def get_multi_lora(self, **kwargs):
         loras = []
@@ -127,9 +172,9 @@ class ADPipelineConfig:
             }
         }
 
-    RETURN_TYPES = CONFIG
-    FUNCTION = "get_config"
-    CATEGORY = "AsyncDiff"        
+    RETURN_TYPES    = CONFIG
+    FUNCTION        = "get_config"
+    CATEGORY        = "AsyncDiff"        
 
     def get_config(
         self, nproc_per_node, model_n, stride, time_shift, variant,
@@ -173,24 +218,85 @@ class ADADSampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(
         self,
         model, motion_adapter, config, positive_prompt, negative_prompt,
         width, height, seed, steps, guidance_scale, num_frames
     ):
-        config["pipeline_type"] =   "ad"
-        config["model"] =           model
-        config["motion_adapter"] =  motion_adapter
+        config["pipeline_type"]     = "ad"
+        config["model"]             = model
+        config["motion_adapter"]    = motion_adapter
         launch_host_process(config)
 
-        # TODO: IPAdapter, load image for input
-        # image = image.squeeze(0)        # NHWC -> HWC
-        # b64_image = convert_tensor_to_b64(image)
         data = {
+            "positive_prompt":      positive_prompt,
+            "negative_prompt":      negative_prompt,
+            "width":                width,
+            "height":               height,
+            "seed":                 seed,
+            "num_inference_steps":  steps,
+            "guidance_scale":       guidance_scale,
+            "num_frames":           num_frames,
+        }
+        response = get_result(data)
+        close_host_process()
+        if response is not None:
+            print("Media generated")
+            output_bytes = base64.b64decode(response)
+            images = pickle.loads(output_bytes)
+            tensors = []
+            for i in images:
+                tensors.append(convert_image_to_hwc_tensor(i))
+            return (torch.stack(tuple(tensors)),)   # HWC -> NHWC
+        else:
+            assert False, "No media generated"
+
+
+class ADADIPASampler:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model":            MODEL,
+                "motion_adapter":   MODEL,
+                "ip_adapter":       IPADAPTER,
+                "image":            IMAGE,
+                "config":           CONFIG,
+                "positive_prompt":  PROMPT,
+                "negative_prompt":  PROMPT,
+                "width":            RESOLUTION,
+                "height":           RESOLUTION,
+                "seed":             SEED,
+                "steps":            STEPS,
+                "guidance_scale":   CFG,
+                "num_frames":       NUM_FRAMES,
+            }
+        }
+
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
+
+    def generate(
+        self,
+        model, motion_adapter, ip_adapter, image, config, positive_prompt, negative_prompt,
+        width, height, seed, steps, guidance_scale, num_frames
+    ):
+        config["pipeline_type"]     = "ad"
+        config["model"]             = model
+        config["motion_adapter"]    = motion_adapter
+        config["ip_adapter"]        = ip_adapter.get("ip_adapter")
+        config["ip_adapter_scale"]  = ip_adapter.get("scale")
+        launch_host_process(config)
+
+        image = image.squeeze(0)        # NHWC -> HWC
+        b64_image = convert_tensor_to_b64(image)
+        data = {
+            "image":                b64_image,
             "positive_prompt":      positive_prompt,
             "negative_prompt":      negative_prompt,
             "width":                width,
@@ -235,14 +341,14 @@ class ADSD1Sampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"] =   "sd1"
-        config["model"] =           model
-        config["scheduler"] =       scheduler
+        config["pipeline_type"]     = "sd1"
+        config["model"]             = model
+        config["scheduler"]         = scheduler
         if lora is not None:
             config["lora"] = lora
         launch_host_process(config)
@@ -285,14 +391,14 @@ class ADSD2Sampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"] =   "sd2"
-        config["model"] =           model
-        config["scheduler"] =       scheduler
+        config["pipeline_type"]     = "sd2"
+        config["model"]             = model
+        config["scheduler"]         = scheduler
         if lora is not None:
             config["lora"] = lora
         launch_host_process(config)
@@ -335,14 +441,14 @@ class ADSD3Sampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"] =   "sd3"
-        config["model"] =           model
-        config["scheduler"] =       scheduler
+        config["pipeline_type"]     = "sd3"
+        config["model"]             = model
+        config["scheduler"]         = scheduler
         if lora is not None:
             config["lora"] = lora
         launch_host_process(config)
@@ -385,14 +491,14 @@ class ADSDXLSampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"] =   "sdxl"
-        config["model"] =           model
-        config["scheduler"] =       scheduler
+        config["pipeline_type"]     = "sdxl"
+        config["model"]             = model
+        config["scheduler"]         = scheduler
         if lora is not None:
             config["lora"] = lora
         launch_host_process(config)
@@ -434,17 +540,17 @@ class ADSVDSampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(
         self,
         model, config, image, width, height, seed, steps, guidance_scale,
         decode_chunk_size, num_frames, motion_bucket_id, noise_aug_strength
     ):
-        config["pipeline_type"] =   "svd"
-        config["model"] =           model
+        config["pipeline_type"]     = "svd"
+        config["model"]             = model
         launch_host_process(config)
 
         image = image.squeeze(0)        # NHWC -> HWC
@@ -492,14 +598,14 @@ class ADSDUpscaleSampler:
             }
         }
 
-    RETURN_TYPES = IMAGE
-    FUNCTION = "generate"
-    CATEGORY = "AsyncDiff"
+    RETURN_TYPES    = IMAGE
+    FUNCTION        = "generate"
+    CATEGORY        = "AsyncDiff"
 
     def generate(self, model, config, image, positive_prompt, negative_prompt, scheduler, seed, steps, guidance_scale):
-        config["pipeline_type"] =   "sdup"
-        config["model"] =           model
-        config["scheduler"] =       scheduler
+        config["pipeline_type"]     = "sdup"
+        config["model"]             = model
+        config["scheduler"]         = scheduler
         launch_host_process(config)
 
         if image.size(0) > 1:
@@ -573,6 +679,10 @@ def launch_host_process(config):
     if config.get("lora"):
         cmd.append(f'--lora={json.dumps(config.get("lora"))}')
 
+    if config.get("ip_adapter"):
+        cmd.append(f'--ip_adapter={ipadapter_dir}/{config.get("ip_adapter")}')
+        cmd.append(f'--ip_adapter_scale={config.get("ip_adapter_scale")}')
+
     if config.get("enable_model_cpu_offload"):
         cmd.append('--enable_model_cpu_offload')
 
@@ -599,7 +709,7 @@ def launch_host_process(config):
             pass
         time.sleep(1)
         connection_attempts += 1
-        if connection_attempts >= 60:
+        if connection_attempts >= connection_attempts_max:
             assert False, "Failed to launch host. Check logs for details."
 
 
@@ -644,6 +754,8 @@ def convert_tensor_to_b64(tensor):
 
 NODE_CLASS_MAPPINGS = {
     "ADADSampler":          ADADSampler,
+    "ADADIPASampler":       ADADIPASampler,
+    "ADIPAdapterSelector":  ADIPAdapterSelector,
     "ADLoraSelector":       ADLoraSelector,
     "ADModelSelector":      ADModelSelector,
     "ADMultiLoraSelector":  ADMultiLoraSelector,
@@ -660,6 +772,8 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ADADSampler":          "ADADSampler",
+    "ADADIPASampler":       "ADADIPASampler",
+    "ADIPAdapterSelector":  "ADIPAdapterSelector",
     "ADLoraSelector":       "ADLoraSelector",
     "ADModelSelector":      "ADModelSelector",
     "ADMultiLoraSelector":  "ADMultiLoraSelector",
