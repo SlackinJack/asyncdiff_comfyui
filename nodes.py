@@ -13,11 +13,32 @@ from PIL import Image
 from torchvision.transforms import ToPILImage, ToTensor
 
 
-host_address            = 'http://localhost:6000'
+PORT = "6000"
+MASTER_PORT = "29400"
+
+
+host_address            = f'http://localhost:{PORT}'
 host_process            = None
 host_address_generate   = f'{host_address}/generate'
 host_address_initialize = f'{host_address}/initialize'
-connection_attempts_max = 60
+
+
+def getModelFilesInFolder(folder_in):
+    model_extensions = ["safetensors"] # "bin", "ckpt"
+    out = []
+    for path in os.walk(folder_in):
+        for f in glob(os.path.join(path[0], '*/*.*'), recursive=True):
+            if f.split(".")[-1] in model_extensions:
+                out.append(f.replace(folder_in + "/", ""))
+    return out
+
+
+def getModelSubfoldersInFolder(folder_in):
+    out = []
+    for path in os.listdir(folder_in):
+        if os.path.isdir(os.path.join(folder_in, path)):
+            out.append(path)
+    return out
 
 
 cwd             = os.path.dirname(__file__)
@@ -25,23 +46,13 @@ comfy_root      = os.path.dirname(os.path.dirname(cwd))
 outputs_dir     = os.path.join(comfy_root, "output")
 models_dir      = os.path.join(os.path.join(comfy_root, "models"))
 checkpoints_dir = os.path.join(models_dir, "checkpoints")
-models          = [d for d in os.listdir(checkpoints_dir) if os.path.isdir(os.path.join(checkpoints_dir, d))]
-
-
-def getModelSubfolder(folderIn):
-    model_extensions = ["bin", "safetensors"]
-    out = []
-    for path in os.walk(folderIn):
-        for f in glob(os.path.join(path[0], '**/*.*'), recursive=True):
-            if f.split(".")[-1] in model_extensions:
-                out.append(f.replace(folderIn + "/", ""))
-    return out
-
-
+models          = getModelSubfoldersInFolder(checkpoints_dir)
+controlnet_dir  = os.path.join(models_dir, "controlnet")
+controlnets     = getModelSubfoldersInFolder(controlnet_dir)
 loras_dir       = os.path.join(models_dir, "loras")
-loras           = getModelSubfolder(loras_dir)
+loras           = getModelFilesInFolder(loras_dir)
 ipadapter_dir   = os.path.join(models_dir, "ipadapter")
-ipadapters      = getModelSubfolder(ipadapter_dir)
+ipadapters      = getModelFilesInFolder(ipadapter_dir)
 
 
 INT_MAX                 = 2 ** 32 - 1
@@ -49,15 +60,16 @@ INT_MIN                 = -1 * INT_MAX
 BOOLEAN_DEFAULT_FALSE   = ("BOOLEAN", { "default": False })
 CONFIG                  = ("AD_CONFIG",)
 IMAGE                   = ("IMAGE",)
+CONTROLNET              = ("AD_CONTROLNET",)
+CONTROLNET_LIST         = (controlnets,)
 LORA                    = ("AD_LORA",)
 LORA_LIST               = (loras,)
 MODEL                   = ("AD_MODEL",)
 MODEL_LIST              = (models,)
 IPADAPTER               = ("AD_IPADAPTER",)
 IPADAPTER_LIST          = (ipadapters,)
-
-
-SCHEDULERS = (
+SCHEDULER               = ("AD_SCHEDULER",)
+SCHEDULER_LIST = (
     list([
         "ddim",
         "euler",
@@ -76,6 +88,19 @@ SCHEDULERS = (
         "default": "dpmpp_2m"
     }
 )
+SD_PIPELINE_LIST = (
+    list([
+        "sd1",
+        "sd2",
+        "sd3",
+        "sdxl",
+    ]),
+    {
+        "default": "sd1",
+    }
+)
+
+
 VARIANT                 = (["bf16", "fp16", "fp32"],  { "default": "fp16" })
 MODEL_N                 = ("INT",                     { "default": 2,     "min": 2,       "max": 4,       "step": 1 })
 STRIDE                  = ("INT",                     { "default": 1,     "min": 1,       "max": 2,       "step": 1 })
@@ -88,61 +113,97 @@ RESOLUTION              = ("INT",                     { "default": 512,   "min":
 SEED                    = ("INT",                     { "default": 0,     "min": 0,       "max": INT_MAX, "step": 1 })
 STEPS                   = ("INT",                     { "default": 60,    "min": 1,       "max": INT_MAX, "step": 1 })
 DECODE_CHUNK_SIZE       = ("INT",                     { "default": 8,     "min": 1,       "max": INT_MAX, "step": 1 })
-NUM_FRAMES              = ("INT",                     { "default": 25,    "min": 1,       "max": INT_MAX, "step": 1 })
+NUM_FRAMES              = ("INT",                     { "default": 25,    "min": 1,       "max": INT_MAX, "step": 1 })      # AD max = 32
 MOTION_BUCKET_ID        = ("INT",                     { "default": 180,   "min": 1,       "max": INT_MAX, "step": 1 })
+WARM_UP_STEPS           = ("INT",                     { "default": 40,    "min": 0,       "max": INT_MAX, "step": 1 })
+PIPELINE_INIT_TIMEOUT   = ("INT",                     { "default": 60,    "min": 0,       "max": INT_MAX, "step": 1 })
 CFG                     = ("FLOAT",                   { "default": 3.5,   "min": 0,       "max": INT_MAX, "step": 0.1 })
 NOISE_AUG_STRENGTH      = ("FLOAT",                   { "default": 0.01,  "min": 0,       "max": INT_MAX, "step": 0.01 })
 LORA_WEIGHT             = ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
+CONTROLNET_SCALE        = ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
 IP_ADAPTER_SCALE        = ("FLOAT",                   { "default": 1.00,  "min": INT_MIN, "max": INT_MAX, "step": 0.01 })
 
 
-class ADModelSelector:
+ASYNCDIFF_CATEGORY              = "AsyncDiff"
+ASYNCDIFF_CATEGORY_CONFIG       = f"{ASYNCDIFF_CATEGORY}/Configuration"
+ASYNCDIFF_CATEGORY_LOADER       = f"{ASYNCDIFF_CATEGORY}/Loaders"
+ASYNCDIFF_CATEGORY_AD_SAMPLER   = f"{ASYNCDIFF_CATEGORY}/Samplers (AnimateDiff)"
+ASYNCDIFF_CATEGORY_SD_SAMPLER   = f"{ASYNCDIFF_CATEGORY}/Samplers (StableDiffusion)"
+
+
+class ADSchedulerSelector:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "required": { "scheduler": SCHEDULER_LIST } }
+
+    RETURN_TYPES    = SCHEDULER
+    FUNCTION        = "get_scheduler"
+    CATEGORY        = ASYNCDIFF_CATEGORY
+
+    def get_scheduler(self, scheduler):
+        return (scheduler,)
+
+
+class ADModelLoader:
     @classmethod
     def INPUT_TYPES(s):
         return { "required": { "model": MODEL_LIST } }
 
     RETURN_TYPES    = MODEL
     FUNCTION        = "get_model"
-    CATEGORY        = "AsyncDiff"        
+    CATEGORY        = ASYNCDIFF_CATEGORY_LOADER
 
     def get_model(self, model):
-        return (model,)
+        return (f"{checkpoints_dir}/{model}",)
 
 
-class ADLoraSelector:
+class ADControlNetLoader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return { "required": { "controlnet": CONTROLNET_LIST, "scale": CONTROLNET_SCALE } }
+
+    RETURN_TYPES    = CONTROLNET
+    FUNCTION        = "get_controlnet_with_scale"
+    CATEGORY        = ASYNCDIFF_CATEGORY_LOADER
+
+    def get_controlnet_with_scale(self, controlnet, scale):
+        return ({ "controlnet": f"{controlnet_dir}/{controlnet}", "scale": scale },)
+
+
+class ADLoraLoader:
     @classmethod
     def INPUT_TYPES(s):
         return { "required": { "lora": LORA_LIST, "weight": LORA_WEIGHT } }
 
     RETURN_TYPES    = LORA
     FUNCTION        = "get_lora_with_weight"
-    CATEGORY        = "AsyncDiff"        
+    CATEGORY        = ASYNCDIFF_CATEGORY_LOADER
 
     def get_lora_with_weight(self, lora, weight):
-        return ([{ "lora": loras_dir + "/" + lora, "weight": weight }],)
+        return ([{ "lora": f"{loras_dir}/{lora}", "weight": weight }],)
 
 
-class ADIPAdapterSelector:
+class ADIPAdapterLoader:
     @classmethod
     def INPUT_TYPES(s):
         return { "required": { "ip_adapter": IPADAPTER_LIST, "scale": IP_ADAPTER_SCALE } }
 
     RETURN_TYPES    = IPADAPTER
     FUNCTION        = "get_ipadapter_with_scale"
-    CATEGORY        = "AsyncDiff"        
+    CATEGORY        = ASYNCDIFF_CATEGORY_LOADER
 
     def get_ipadapter_with_scale(self, ip_adapter, scale):
-        return ({ "ip_adapter": ip_adapter, "scale": scale },)
+        return ({ "ip_adapter": f"{ipadapter_dir}/{ip_adapter}", "scale": scale },)
 
 
-class ADMultiLoraSelector:
+class ADMultiLoraCombiner:
     @classmethod
     def INPUT_TYPES(s):
         return { "optional": { "lora_1": LORA, "lora_2": LORA, "lora_3": LORA, "lora_4": LORA } }
 
     RETURN_TYPES    = LORA
     FUNCTION        = "get_multi_lora"
-    CATEGORY        = "AsyncDiff"        
+    CATEGORY        = ASYNCDIFF_CATEGORY_LOADER
 
     def get_multi_lora(self, **kwargs):
         loras = []
@@ -169,16 +230,19 @@ class ADPipelineConfig:
                 "enable_tiling":                    BOOLEAN_DEFAULT_FALSE,
                 "enable_slicing":                   BOOLEAN_DEFAULT_FALSE,
                 "xformers_efficient":               BOOLEAN_DEFAULT_FALSE,
+                "warm_up_steps":                    WARM_UP_STEPS,
+                "pipeline_init_timeout":            PIPELINE_INIT_TIMEOUT,
             }
         }
 
     RETURN_TYPES    = CONFIG
     FUNCTION        = "get_config"
-    CATEGORY        = "AsyncDiff"        
+    CATEGORY        = ASYNCDIFF_CATEGORY_CONFIG
 
     def get_config(
-        self, nproc_per_node, model_n, stride, time_shift, variant,
-        scale_input, scale_percentage, enable_tiling, enable_slicing, xformers_efficient,
+        self,
+        nproc_per_node, model_n, stride, time_shift, variant, scale_input, scale_percentage,
+        enable_tiling, enable_slicing, xformers_efficient, warm_up_steps,  pipeline_init_timeout,
         enable_model_cpu_offload=False, enable_sequential_cpu_offload=False
     ):
         return (
@@ -195,9 +259,10 @@ class ADPipelineConfig:
                 "enable_tiling":                    enable_tiling,
                 "enable_slicing":                   enable_slicing,
                 "xformers_efficient":               xformers_efficient,
+                "warm_up_steps":                    warm_up_steps,
+                "pipeline_init_timeout":            pipeline_init_timeout,
             },
         )
-
 
 class ADADSampler:
     @classmethod
@@ -215,88 +280,37 @@ class ADADSampler:
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
                 "num_frames":       NUM_FRAMES,
-            }
-        }
-
-    RETURN_TYPES    = IMAGE
-    FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
-
-    def generate(
-        self,
-        model, motion_adapter, config, positive_prompt, negative_prompt,
-        width, height, seed, steps, guidance_scale, num_frames
-    ):
-        config["pipeline_type"]     = "ad"
-        config["model"]             = model
-        config["motion_adapter"]    = motion_adapter
-        launch_host_process(config)
-
-        data = {
-            "positive_prompt":      positive_prompt,
-            "negative_prompt":      negative_prompt,
-            "width":                width,
-            "height":               height,
-            "seed":                 seed,
-            "num_inference_steps":  steps,
-            "guidance_scale":       guidance_scale,
-            "num_frames":           num_frames,
-        }
-        response = get_result(data)
-        close_host_process()
-        if response is not None:
-            print("Media generated")
-            output_bytes = base64.b64decode(response)
-            images = pickle.loads(output_bytes)
-            tensors = []
-            for i in images:
-                tensors.append(convert_image_to_hwc_tensor(i))
-            return (torch.stack(tuple(tensors)),)   # HWC -> NHWC
-        else:
-            assert False, "No media generated"
-
-
-class ADADIPASampler:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model":            MODEL,
-                "motion_adapter":   MODEL,
+            },
+            "optional": {
+                "control_net":      CONTROLNET,
                 "ip_adapter":       IPADAPTER,
                 "image":            IMAGE,
-                "config":           CONFIG,
-                "positive_prompt":  PROMPT,
-                "negative_prompt":  PROMPT,
-                "width":            RESOLUTION,
-                "height":           RESOLUTION,
-                "seed":             SEED,
-                "steps":            STEPS,
-                "guidance_scale":   CFG,
-                "num_frames":       NUM_FRAMES,
             }
         }
 
     RETURN_TYPES    = IMAGE
     FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
+    CATEGORY        = ASYNCDIFF_CATEGORY_AD_SAMPLER
 
     def generate(
         self,
-        model, motion_adapter, ip_adapter, image, config, positive_prompt, negative_prompt,
-        width, height, seed, steps, guidance_scale, num_frames
+        model, motion_adapter, config, positive_prompt, negative_prompt, width, height,
+        seed, steps, guidance_scale, num_frames, control_net=None, ip_adapter=None, image=None
     ):
+        assert (image is None and ip_adapter is None) or (image is not None and ip_adapter is not None), "Image and IPAdapter must be set at the same time."
+        assert len(positive_prompt) > 0, "You must provide a prompt."
+
         config["pipeline_type"]     = "ad"
         config["model"]             = model
         config["motion_adapter"]    = motion_adapter
-        config["ip_adapter"]        = ip_adapter.get("ip_adapter")
-        config["ip_adapter_scale"]  = ip_adapter.get("scale")
+        if control_net is not None:
+            config["control_net"]       = control_net.get("controlnet")
+        if image is not None and ip_adapter is not None:
+            config["ip_adapter"]        = ip_adapter.get("ip_adapter")
+            config["ip_adapter_scale"]  = ip_adapter.get("scale")
         launch_host_process(config)
 
-        image = image.squeeze(0)        # NHWC -> HWC
-        b64_image = convert_tensor_to_b64(image)
         data = {
-            "image":                b64_image,
             "positive_prompt":      positive_prompt,
             "negative_prompt":      negative_prompt,
             "width":                width,
@@ -306,6 +320,15 @@ class ADADIPASampler:
             "guidance_scale":       guidance_scale,
             "num_frames":           num_frames,
         }
+
+        if control_net is not None:
+            data["controlnet_scale"] = control_net.get("scale")
+
+        if image is not None and ip_adapter is not None:
+            image = image.squeeze(0)                # NHWC -> HWC
+            b64_image = convert_tensor_to_b64(image)
+            data["image"] = b64_image
+
         response = get_result(data)
         close_host_process()
         if response is not None:
@@ -320,187 +343,41 @@ class ADADIPASampler:
             assert False, "No media generated"
 
 
-class ADSD1Sampler:
+class ADSDSampler:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "model":            MODEL,
+                "model_type":       SD_PIPELINE_LIST,
                 "config":           CONFIG,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
                 "width":            RESOLUTION,
                 "height":           RESOLUTION,
-                "scheduler":        SCHEDULERS,
                 "seed":             SEED,
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
             },
             "optional": {
                 "lora":             LORA,
+                "scheduler":        SCHEDULER,
             }
         }
 
     RETURN_TYPES    = IMAGE
     FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
+    CATEGORY        = ASYNCDIFF_CATEGORY_SD_SAMPLER
 
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"]     = "sd1"
+    def generate(self, model, model_type, config, positive_prompt, negative_prompt, width, height, seed, steps, guidance_scale, lora=None, scheduler=None):
+        assert len(positive_prompt) > 0, "You must provide a prompt."
+
+        config["pipeline_type"]     = model_type
         config["model"]             = model
-        config["scheduler"]         = scheduler
         if lora is not None:
             config["lora"] = lora
-        launch_host_process(config)
-
-        data = {
-            "positive_prompt":      positive_prompt,
-            "negative_prompt":      negative_prompt,
-            "width":                width,
-            "height":               height,
-            "seed":                 seed,
-            "num_inference_steps":  steps,
-            "guidance_scale":       guidance_scale,
-        }
-        response = get_result(data)
-        close_host_process()
-        if response is not None:
-            return (convert_b64_to_nhwc_tensor(response),)
-        else:
-            assert False, "No media generated"
-
-
-class ADSD2Sampler:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model":            MODEL,
-                "config":           CONFIG,
-                "positive_prompt":  PROMPT,
-                "negative_prompt":  PROMPT,
-                "width":            RESOLUTION,
-                "height":           RESOLUTION,
-                "scheduler":        SCHEDULERS,
-                "seed":             SEED,
-                "steps":            STEPS,
-                "guidance_scale":   CFG,
-            },
-            "optional": {
-                "lora":             LORA,
-            }
-        }
-
-    RETURN_TYPES    = IMAGE
-    FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
-
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"]     = "sd2"
-        config["model"]             = model
-        config["scheduler"]         = scheduler
-        if lora is not None:
-            config["lora"] = lora
-        launch_host_process(config)
-
-        data = {
-            "positive_prompt":      positive_prompt,
-            "negative_prompt":      negative_prompt,
-            "width":                width,
-            "height":               height,
-            "seed":                 seed,
-            "num_inference_steps":  steps,
-            "guidance_scale":       guidance_scale,
-        }
-        response = get_result(data)
-        close_host_process()
-        if response is not None:
-            return (convert_b64_to_nhwc_tensor(response),)
-        else:
-            assert False, "No media generated"
-
-
-class ADSD3Sampler:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model":            MODEL,
-                "config":           CONFIG,
-                "positive_prompt":  PROMPT,
-                "negative_prompt":  PROMPT,
-                "width":            RESOLUTION,
-                "height":           RESOLUTION,
-                "scheduler":        SCHEDULERS,
-                "seed":             SEED,
-                "steps":            STEPS,
-                "guidance_scale":   CFG,
-            },
-            "optional": {
-                "lora":             LORA,
-            }
-        }
-
-    RETURN_TYPES    = IMAGE
-    FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
-
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"]     = "sd3"
-        config["model"]             = model
-        config["scheduler"]         = scheduler
-        if lora is not None:
-            config["lora"] = lora
-        launch_host_process(config)
-
-        data = {
-            "positive_prompt":      positive_prompt,
-            "negative_prompt":      negative_prompt,
-            "width":                width,
-            "height":               height,
-            "seed":                 seed,
-            "num_inference_steps":  steps,
-            "guidance_scale":       guidance_scale,
-        }
-        response = get_result(data)
-        close_host_process()
-        if response is not None:
-            return (convert_b64_to_nhwc_tensor(response),)
-        else:
-            assert False, "No media generated"
-
-
-class ADSDXLSampler:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "model":            MODEL,
-                "config":           CONFIG,
-                "positive_prompt":  PROMPT,
-                "negative_prompt":  PROMPT,
-                "width":            RESOLUTION,
-                "height":           RESOLUTION,
-                "scheduler":        SCHEDULERS,
-                "seed":             SEED,
-                "steps":            STEPS,
-                "guidance_scale":   CFG,
-            },
-            "optional": {
-                "lora":            LORA,
-            }
-        }
-
-    RETURN_TYPES    = IMAGE
-    FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
-
-    def generate(self, model, config, positive_prompt, negative_prompt, width, height, scheduler, seed, steps, guidance_scale, lora=None):
-        config["pipeline_type"]     = "sdxl"
-        config["model"]             = model
-        config["scheduler"]         = scheduler
-        if lora is not None:
-            config["lora"] = lora
+        if scheduler is not None:
+            config["scheduler"] = scheduler
         launch_host_process(config)
 
         data = {
@@ -542,7 +419,7 @@ class ADSVDSampler:
 
     RETURN_TYPES    = IMAGE
     FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
+    CATEGORY        = ASYNCDIFF_CATEGORY_SD_SAMPLER
 
     def generate(
         self,
@@ -553,7 +430,7 @@ class ADSVDSampler:
         config["model"]             = model
         launch_host_process(config)
 
-        image = image.squeeze(0)        # NHWC -> HWC
+        image = image.squeeze(0)                    # NHWC -> HWC
         b64_image = convert_tensor_to_b64(image)
         data = {
             "image":                b64_image,
@@ -591,21 +468,26 @@ class ADSDUpscaleSampler:
                 "image":            IMAGE,
                 "positive_prompt":  PROMPT,
                 "negative_prompt":  PROMPT,
-                "scheduler":        SCHEDULERS,
                 "seed":             SEED,
                 "steps":            STEPS,
                 "guidance_scale":   CFG,
+            },
+            "optional": {
+                "scheduler":        SCHEDULER,
             }
         }
 
     RETURN_TYPES    = IMAGE
     FUNCTION        = "generate"
-    CATEGORY        = "AsyncDiff"
+    CATEGORY        = ASYNCDIFF_CATEGORY_SD_SAMPLER
 
-    def generate(self, model, config, image, positive_prompt, negative_prompt, scheduler, seed, steps, guidance_scale):
+    def generate(self, model, config, image, positive_prompt, negative_prompt, seed, steps, guidance_scale, scheduler=None):
+        assert len(positive_prompt) > 0, "You must provide a prompt."
+
         config["pipeline_type"]     = "sdup"
         config["model"]             = model
-        config["scheduler"]         = scheduler
+        if scheduler is not None:
+            config["scheduler"] = scheduler
         launch_host_process(config)
 
         if image.size(0) > 1:
@@ -643,7 +525,7 @@ class ADSDUpscaleSampler:
                 print("Error getting data from server.")
                 print(str(e))
         close_host_process()
-        return (torch.stack(tuple(tensors)),)                   # HWC -> NHWC
+        return (torch.stack(tuple(tensors)),)       # HWC -> NHWC
 
 
 def launch_host_process(config):
@@ -655,10 +537,12 @@ def launch_host_process(config):
     cmd = [
         'torchrun',
         f'--nproc_per_node={config.get("nproc_per_node")}',
+        f'--master-port={MASTER_PORT}',
         f'{cwd}/host.py',
 
+        f'--port={PORT}',
         '--host_mode=comfyui',
-        f'--model={checkpoints_dir}/{config.get("model")}',
+        f'--model={config.get("model")}',
         f'--pipeline_type={config.get("pipeline_type")}',
         f'--model_n={config.get("model_n")}',
         f'--stride={config.get("stride")}',
@@ -666,11 +550,11 @@ def launch_host_process(config):
         f'--variant={config.get("variant")}',
     ]
 
-    if config.get("pipeline_type") in ["sd1", "sd2", "sd3", "sdup", "sdxl"]:
+    if config.get("scheduler") and config.get("pipeline_type") in ["sd1", "sd2", "sd3", "sdup", "sdxl"]:
         cmd.append(f'--scheduler={config.get("scheduler")}')
 
     if config.get("pipeline_type") in ["ad"]:
-        cmd.append(f'--motion_adapter={checkpoints_dir}/{config.get("motion_adapter")}')
+        cmd.append(f'--motion_adapter={config.get("motion_adapter")}')
 
     if config.get("scale_input"):
         cmd.append('--scale_input')
@@ -679,8 +563,11 @@ def launch_host_process(config):
     if config.get("lora"):
         cmd.append(f'--lora={json.dumps(config.get("lora"))}')
 
+    if config.get("control_net"):
+        cmd.append(f'--control_net={config.get("control_net")}')
+
     if config.get("ip_adapter"):
-        cmd.append(f'--ip_adapter={ipadapter_dir}/{config.get("ip_adapter")}')
+        cmd.append(f'--ip_adapter={config.get("ip_adapter")}')
         cmd.append(f'--ip_adapter_scale={config.get("ip_adapter_scale")}')
 
     if config.get("enable_model_cpu_offload"):
@@ -709,8 +596,8 @@ def launch_host_process(config):
             pass
         time.sleep(1)
         connection_attempts += 1
-        if connection_attempts >= connection_attempts_max:
-            assert False, "Failed to launch host. Check logs for details."
+        if connection_attempts >= config.get("pipeline_init_timeout"):
+            assert False, f"Failed to launch host within {pipeline_init_timeout} seconds.\nCheck ComfyUI console for details."
 
 
 def close_host_process():
@@ -753,35 +640,31 @@ def convert_tensor_to_b64(tensor):
 
 
 NODE_CLASS_MAPPINGS = {
+    "ADSchedulerSelector":  ADSchedulerSelector,
     "ADADSampler":          ADADSampler,
-    "ADADIPASampler":       ADADIPASampler,
-    "ADIPAdapterSelector":  ADIPAdapterSelector,
-    "ADLoraSelector":       ADLoraSelector,
-    "ADModelSelector":      ADModelSelector,
-    "ADMultiLoraSelector":  ADMultiLoraSelector,
+    "ADControlNetLoader":   ADControlNetLoader,
+    "ADIPAdapterLoader":    ADIPAdapterLoader,
+    "ADLoraLoader":         ADLoraLoader,
+    "ADModelLoader":        ADModelLoader,
+    "ADMultiLoraCombiner":  ADMultiLoraCombiner,
     "ADPipelineConfig":     ADPipelineConfig,
-    "ADSD1Sampler":         ADSD1Sampler,
-    "ADSD2Sampler":         ADSD2Sampler,
-    "ADSD3Sampler":         ADSD3Sampler,
+    "ADSDSampler":          ADSDSampler,
     "ADSDUpscaleSampler":   ADSDUpscaleSampler,
-    "ADSDXLSampler":        ADSDXLSampler,
     "ADSVDSampler":         ADSVDSampler,
     
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ADADSampler":          "ADADSampler",
-    "ADADIPASampler":       "ADADIPASampler",
-    "ADIPAdapterSelector":  "ADIPAdapterSelector",
-    "ADLoraSelector":       "ADLoraSelector",
-    "ADModelSelector":      "ADModelSelector",
-    "ADMultiLoraSelector":  "ADMultiLoraSelector",
-    "ADPipelineConfig":     "ADPipelineConfig",
-    "ADSD1Sampler":         "ADSD1Sampler",
-    "ADSD2Sampler":         "ADSD2Sampler",
-    "ADSD3Sampler":         "ADSD3Sampler",
+    "ADSchedulerSelector":  "ADSchedulerSelector",
+    "ADADSampler":          "ADAnimateDiffSampler",
+    "ADControlNetLoader":   "ADControlNetLoader",
+    "ADIPAdapterLoader":    "ADIPAdapterLoader",
+    "ADLoraLoader":         "ADLoraLoader",
+    "ADModelLoader":        "ADModelLoader",
+    "ADMultiLoraCombiner":  "ADMultiLoraCombiner",
+    "ADPipelineConfig":     "ADPipelineConfigurator",
+    "ADSDSampler":          "ADSDSampler",
     "ADSDUpscaleSampler":   "ADSDUpscaleSampler",
-    "ADSDXLSampler":        "ADSDXLSampler",
     "ADSVDSampler":         "ADSVDSampler",
 }
